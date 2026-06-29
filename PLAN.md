@@ -129,7 +129,15 @@ codex exec \
 - [x] Expose pending-call and active-session counts from `/healthz`.
 - [x] Add tests for store removal, expiry, and snapshots.
 - [ ] Add structured metrics export.
-- [ ] Add CI packaging and release artifacts.
+
+### 7. Packaging And Operations
+
+- [x] Add CI restore/test/build workflow.
+- [x] Add osx-arm64 self-contained publish artifact workflow.
+- [x] Add local osx-arm64 publish script.
+- [x] Add macOS launchd plist template.
+- [x] Add macOS install/uninstall scripts.
+- [ ] Add Homebrew formula.
 
 ## Safety Rules
 
@@ -151,4 +159,6 @@ The initial full bridge loop is verified: when Copilot requests an external tool
 
 Lifecycle hardening is now implemented for in-memory state: pending calls are centralized in a store, active operations have a request timeout, pending tool calls expire after a TTL, expired Copilot sessions are disposed by a hosted cleanup service, and `/healthz` reports pending-call and active-session counts. Store lifecycle behavior is covered by unit tests.
 
-The next production-relevant slice is packaging and operations: a release build, install script or Homebrew formula, launchd service template for macOS, and CI that runs tests/builds on push.
+Packaging and operations now have a first pass: CI runs restore/test/build, non-PR runs publish an osx-arm64 artifact, local publishing creates both a publish directory and tarball, and macOS launchd install/uninstall scripts run the bridge as a user service.
+
+The next production-relevant slice is distribution polish: Homebrew formula, signed/notarized macOS artifacts if this is shared outside your machine, and structured metrics export.

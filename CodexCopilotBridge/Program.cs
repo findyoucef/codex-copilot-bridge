@@ -3,7 +3,11 @@ using CodexCopilotBridge.Inference;
 using CodexCopilotBridge.Protocol;
 using Microsoft.Extensions.Options;
 
-var builder = WebApplication.CreateBuilder(args);
+var builder = WebApplication.CreateBuilder(new WebApplicationOptions
+{
+    Args = args,
+    ContentRootPath = AppContext.BaseDirectory
+});
 builder.Services.Configure<BridgeOptions>(builder.Configuration.GetSection("Bridge"));
 builder.Services.AddSingleton<PendingToolCallStore>();
 builder.Services.AddHostedService<PendingToolCallCleanupService>();

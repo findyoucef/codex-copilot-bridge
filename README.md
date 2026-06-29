@@ -10,6 +10,57 @@ dotnet run --project CodexCopilotBridge/CodexCopilotBridge.csproj --urls http://
 
 The default mode is `CopilotBridge`: Codex sends its tool declarations to the bridge, Copilot can request those declaration-only tools, and Codex remains the executor for shell, filesystem, MCP, and other tool calls.
 
+## Package
+
+```bash
+scripts/publish-osx-arm64.sh
+```
+
+This creates:
+
+```text
+artifacts/publish/codex-copilot-bridge-osx-arm64/
+artifacts/dist/codex-copilot-bridge-osx-arm64.tar.gz
+```
+
+The archive is also produced by GitHub Actions on pushes to `main`.
+
+## macOS Service
+
+Install the latest local publish as a launchd user service:
+
+```bash
+scripts/install-macos-launchd.sh
+```
+
+To install from the CI tarball, extract it first and pass the extracted publish directory:
+
+```bash
+tar -xzf codex-copilot-bridge-osx-arm64.tar.gz
+scripts/install-macos-launchd.sh ./codex-copilot-bridge-osx-arm64
+```
+
+Useful overrides:
+
+```bash
+CODEX_COPILOT_BRIDGE_PORT=17776 \
+CODEX_COPILOT_BRIDGE_INSTALL_DIR="$HOME/.local/share/codex-copilot-bridge" \
+CODEX_COPILOT_BRIDGE_LOG_DIR="$HOME/Library/Logs/codex-copilot-bridge" \
+scripts/install-macos-launchd.sh
+```
+
+Uninstall:
+
+```bash
+scripts/uninstall-macos-launchd.sh
+```
+
+Remove installed files and logs too:
+
+```bash
+scripts/uninstall-macos-launchd.sh --remove-files
+```
+
 ## Health
 
 ```bash
@@ -104,3 +155,7 @@ Codex may warn that it has no built-in model metadata for `gpt-5.5`; the probe s
 ```
 
 `RequestTimeout` caps each active `/v1/responses` bridge operation. `PendingToolCallTtl` caps how long a Copilot session can wait for Codex to return tool output. The cleanup service disposes expired sessions on `PendingToolCallCleanupInterval`.
+
+## CI
+
+`.github/workflows/ci.yml` runs restore, tests, build, and an osx-arm64 self-contained publish. The publish job uploads `codex-copilot-bridge-osx-arm64.tar.gz` for non-PR runs.
