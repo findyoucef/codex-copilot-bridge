@@ -39,6 +39,23 @@ public sealed class ProtocolTests
     }
 
     [Fact]
+    public void FunctionCallDone_UsesCodexFunctionCallShape()
+    {
+        var json = JsonSerializer.Serialize(
+            ResponsesEvents.FunctionCallDone("call_1", "shell_command", "{\"command\":\"pwd\"}"),
+            ProtocolJson.SerializerOptions);
+
+        using var document = JsonDocument.Parse(json);
+        var root = document.RootElement;
+
+        Assert.Equal("response.output_item.done", root.GetProperty("type").GetString());
+        Assert.Equal("function_call", root.GetProperty("item").GetProperty("type").GetString());
+        Assert.Equal("call_1", root.GetProperty("item").GetProperty("call_id").GetString());
+        Assert.Equal("shell_command", root.GetProperty("item").GetProperty("name").GetString());
+        Assert.Equal("{\"command\":\"pwd\"}", root.GetProperty("item").GetProperty("arguments").GetString());
+    }
+
+    [Fact]
     public void ModelCatalog_IncludesRequiredCodexFields()
     {
         var json = JsonSerializer.Serialize(
@@ -88,5 +105,28 @@ public sealed class ProtocolTests
         Assert.Contains("Be concise.", prompt);
         Assert.Contains("user: List files.", prompt);
         Assert.Contains("function_call_output call_1: README.md", prompt);
+    }
+
+    [Fact]
+    public void ToolOutputReader_FindsFunctionCallOutputText()
+    {
+        var request = JsonSerializer.Deserialize<ResponsesApiRequest>(
+            """
+            {
+              "model": "gpt-5",
+              "input": [
+                {
+                  "type": "function_call_output",
+                  "call_id": "call_1",
+                  "output": "tool output"
+                }
+              ]
+            }
+            """,
+            ProtocolJson.SerializerOptions);
+
+        var output = ToolOutputReader.FindTextOutput(request!, "call_1");
+
+        Assert.Equal("tool output", output);
     }
 }

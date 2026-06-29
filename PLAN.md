@@ -102,9 +102,9 @@ codex exec \
 
 ### 3. Codex Tool Loop Spike
 
-- [ ] Emit a synthetic Codex `function_call` item from the bridge.
-- [ ] Verify Codex executes the tool and sends `function_call_output` back.
-- [ ] Add tests for `function_call_output` prompt rendering.
+- [x] Emit a synthetic Codex `function_call` item from the bridge.
+- [x] Verify Codex executes the tool and sends `function_call_output` back.
+- [x] Add tests for `function_call_output` prompt rendering.
 
 ### 4. Copilot External Tool Spike
 

@@ -60,6 +60,28 @@ public static class ResponsesEvents
             }
         };
 
+    public static object FunctionCallDone(string callId, string name, string arguments, string? @namespace = null)
+    {
+        var item = new Dictionary<string, object?>
+        {
+            ["type"] = "function_call",
+            ["call_id"] = callId,
+            ["name"] = name,
+            ["arguments"] = arguments
+        };
+
+        if (!string.IsNullOrWhiteSpace(@namespace))
+        {
+            item["namespace"] = @namespace;
+        }
+
+        return new
+        {
+            Type = "response.output_item.done",
+            Item = item
+        };
+    }
+
     public static object Completed(string responseId, bool endTurn = true) =>
         new
         {

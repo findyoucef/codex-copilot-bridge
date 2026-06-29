@@ -3,5 +3,6 @@ namespace CodexCopilotBridge;
 public enum BridgeMode
 {
     Echo,
-    CopilotSdk
+    CopilotSdk,
+    ToolProbe
 }

@@ -38,3 +38,11 @@ Echo-mode smoke run:
 ```bash
 Bridge__Mode=Echo dotnet run --project CodexCopilotBridge/CodexCopilotBridge.csproj --urls http://127.0.0.1:17776
 ```
+
+Tool-loop probe:
+
+```bash
+Bridge__Mode=ToolProbe dotnet run --project CodexCopilotBridge/CodexCopilotBridge.csproj --urls http://127.0.0.1:17776
+```
+
+Then point Codex at the bridge. The probe backend emits a `shell_command` function call, waits for Codex to execute it, and summarizes the returned `function_call_output`.

@@ -14,6 +14,9 @@ public static class SseResponseWriter
     {
         var responseId = $"resp_{Guid.NewGuid():N}";
         var finalText = string.Empty;
+        var textItemStarted = false;
+        var emittedText = false;
+        var emittedToolCall = false;
 
         context.Response.StatusCode = StatusCodes.Status200OK;
         context.Response.ContentType = "text/event-stream";
@@ -22,7 +25,6 @@ public static class SseResponseWriter
         context.Response.Headers["openai-model"] = request.Model;
 
         await WriteEventAsync(context, "response.created", ResponsesEvents.Created(responseId, request.Model), cancellationToken);
-        await WriteEventAsync(context, "response.output_item.added", ResponsesEvents.OutputMessageAdded(responseId), cancellationToken);
 
         try
         {
@@ -31,17 +33,46 @@ public static class SseResponseWriter
                 switch (output)
                 {
                     case TextDeltaOutput delta when !string.IsNullOrEmpty(delta.Delta):
+                        if (!textItemStarted)
+                        {
+                            await WriteEventAsync(context, "response.output_item.added", ResponsesEvents.OutputMessageAdded(responseId), cancellationToken);
+                            textItemStarted = true;
+                        }
+
                         finalText += delta.Delta;
+                        emittedText = true;
                         await WriteEventAsync(context, "response.output_text.delta", ResponsesEvents.OutputTextDelta(delta.Delta), cancellationToken);
                         break;
                     case FinalTextOutput final:
                         finalText = final.Text;
+                        emittedText = !string.IsNullOrEmpty(finalText);
+                        break;
+                    case FunctionCallRequestOutput functionCall:
+                        emittedToolCall = true;
+                        await WriteEventAsync(
+                            context,
+                            "response.output_item.done",
+                            ResponsesEvents.FunctionCallDone(
+                                functionCall.CallId,
+                                functionCall.Name,
+                                functionCall.Arguments,
+                                functionCall.Namespace),
+                            cancellationToken);
                         break;
                 }
             }
 
-            await WriteEventAsync(context, "response.output_item.done", ResponsesEvents.OutputMessageDone(responseId, finalText), cancellationToken);
-            await WriteEventAsync(context, "response.completed", ResponsesEvents.Completed(responseId), cancellationToken);
+            if (emittedText)
+            {
+                if (!textItemStarted)
+                {
+                    await WriteEventAsync(context, "response.output_item.added", ResponsesEvents.OutputMessageAdded(responseId), cancellationToken);
+                }
+
+                await WriteEventAsync(context, "response.output_item.done", ResponsesEvents.OutputMessageDone(responseId, finalText), cancellationToken);
+            }
+
+            await WriteEventAsync(context, "response.completed", ResponsesEvents.Completed(responseId, endTurn: !emittedToolCall), cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
