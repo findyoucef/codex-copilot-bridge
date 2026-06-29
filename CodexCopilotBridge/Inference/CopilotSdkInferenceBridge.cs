@@ -1,0 +1,95 @@
+using System.Threading.Channels;
+using CodexCopilotBridge.Protocol;
+using GitHub.Copilot;
+using Microsoft.Extensions.Options;
+
+namespace CodexCopilotBridge.Inference;
+
+public sealed class CopilotSdkInferenceBridge(IOptions<BridgeOptions> options, ILogger<CopilotSdkInferenceBridge> logger) : IInferenceBridge
+{
+    public async IAsyncEnumerable<BridgeOutput> CreateResponseAsync(
+        ResponsesApiRequest request,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var channel = Channel.CreateUnbounded<BridgeOutput>();
+        var prompt = CodexPromptRenderer.Render(request);
+        var model = string.IsNullOrWhiteSpace(request.Model) ? options.Value.DefaultModel : request.Model;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var clientOptions = new CopilotClientOptions
+                {
+                    BaseDirectory = ResolveCopilotHome(),
+                    UseLoggedInUser = true,
+                    Logger = logger
+                };
+
+                await using var client = new CopilotClient(clientOptions);
+                await client.StartAsync(cancellationToken);
+
+                await using var session = await client.CreateSessionAsync(
+                    new SessionConfig
+                    {
+                        Model = model,
+                        Streaming = true
+                    },
+                    cancellationToken);
+
+                var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var finalText = string.Empty;
+
+                session.On<SessionEvent>(evt =>
+                {
+                    switch (evt)
+                    {
+                        case AssistantMessageDeltaEvent delta:
+                            var deltaContent = delta.Data.DeltaContent;
+                            if (!string.IsNullOrEmpty(deltaContent))
+                            {
+                                channel.Writer.TryWrite(new TextDeltaOutput(deltaContent));
+                            }
+                            break;
+                        case AssistantMessageEvent message:
+                            finalText = message.Data.Content ?? string.Empty;
+                            break;
+                        case SessionErrorEvent error:
+                            done.TrySetException(new InvalidOperationException(error.Data.Message));
+                            break;
+                        case SessionIdleEvent:
+                            done.TrySetResult();
+                            break;
+                    }
+                });
+
+                await session.SendAsync(new MessageOptions { Prompt = prompt }, cancellationToken);
+                await done.Task.WaitAsync(cancellationToken);
+                channel.Writer.TryWrite(new FinalTextOutput(finalText));
+                channel.Writer.TryComplete();
+            }
+            catch (Exception ex)
+            {
+                channel.Writer.TryComplete(ex);
+            }
+        }, cancellationToken);
+
+        await foreach (var output in channel.Reader.ReadAllAsync(cancellationToken))
+        {
+            yield return output;
+        }
+    }
+
+    private string? ResolveCopilotHome()
+    {
+        if (!string.IsNullOrWhiteSpace(options.Value.CopilotHome))
+        {
+            return options.Value.CopilotHome;
+        }
+
+        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        return string.IsNullOrWhiteSpace(home)
+            ? null
+            : Path.Combine(home, ".codex-copilot-bridge", "copilot-home");
+    }
+}

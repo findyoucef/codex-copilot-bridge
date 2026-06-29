@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="CodexCopilotBridge.Protocol/CodexCopilotBridge.Protocol.csproj" />
+  <Project Path="CodexCopilotBridge.Tests/CodexCopilotBridge.Tests.csproj" />
+  <Project Path="CodexCopilotBridge/CodexCopilotBridge.csproj" />
+</Solution>
