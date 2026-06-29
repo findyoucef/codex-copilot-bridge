@@ -10,6 +10,14 @@ dotnet run --project CodexCopilotBridge/CodexCopilotBridge.csproj --urls http://
 
 The default mode is `CopilotBridge`: Codex sends its tool declarations to the bridge, Copilot can request those declaration-only tools, and Codex remains the executor for shell, filesystem, MCP, and other tool calls.
 
+## Health
+
+```bash
+curl http://127.0.0.1:17776/healthz
+```
+
+The health response includes `pending_tool_calls`, `active_copilot_sessions`, `oldest_pending_tool_call_age_seconds`, `pending_tool_call_ttl_seconds`, and `request_timeout_seconds`.
+
 ## Codex Provider Config
 
 ```toml
@@ -82,3 +90,17 @@ codex exec --ignore-user-config --skip-git-repo-check \
 ```
 
 Codex may warn that it has no built-in model metadata for `gpt-5.5`; the probe still verifies Copilot external-tool request/response handling.
+
+## Lifecycle Settings
+
+```json
+{
+  "Bridge": {
+    "RequestTimeout": "00:02:00",
+    "PendingToolCallTtl": "00:10:00",
+    "PendingToolCallCleanupInterval": "00:01:00"
+  }
+}
+```
+
+`RequestTimeout` caps each active `/v1/responses` bridge operation. `PendingToolCallTtl` caps how long a Copilot session can wait for Codex to return tool output. The cleanup service disposes expired sessions on `PendingToolCallCleanupInterval`.

@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Text;
 using System.Threading.Channels;
 using CodexCopilotBridge.Protocol;
@@ -8,12 +7,11 @@ using Microsoft.Extensions.Options;
 
 namespace CodexCopilotBridge.Inference;
 
-public sealed class CopilotToolBridgeInferenceBridge(
+internal sealed class CopilotToolBridgeInferenceBridge(
     IOptions<BridgeOptions> options,
+    PendingToolCallStore pendingToolCalls,
     ILogger<CopilotToolBridgeInferenceBridge> logger) : IInferenceBridge, IAsyncDisposable
 {
-    private readonly ConcurrentDictionary<string, PendingToolCall> _pendingCalls = new(StringComparer.Ordinal);
-
     public async IAsyncEnumerable<BridgeOutput> CreateResponseAsync(
         ResponsesApiRequest request,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
@@ -27,11 +25,15 @@ public sealed class CopilotToolBridgeInferenceBridge(
 
         _ = Task.Run(async () =>
         {
+            var requestTimeout = Positive(options.Value.RequestTimeout, TimeSpan.FromMinutes(2));
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(requestTimeout);
+
             try
             {
-                if (TryFindPendingToolOutput(request, out var pendingToolOutput))
+                if (pendingToolCalls.TryTakeOutput(request, out var pendingToolOutput))
                 {
-                    await ContinuePendingToolCallAsync(pendingToolOutput, channel.Writer, cancellationToken);
+                    await ContinuePendingToolCallAsync(pendingToolOutput, channel.Writer, timeout.Token);
                 }
                 else if (ToolOutputReader.FindFirstOutputCallId(request) is { } orphanedCallId)
                 {
@@ -39,10 +41,14 @@ public sealed class CopilotToolBridgeInferenceBridge(
                 }
                 else
                 {
-                    await StartCopilotTurnAsync(request, channel.Writer, cancellationToken);
+                    await StartCopilotTurnAsync(request, channel.Writer, timeout.Token);
                 }
 
                 channel.Writer.TryComplete();
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                channel.Writer.TryComplete(new TimeoutException($"Copilot bridge request timed out after {requestTimeout}."));
             }
             catch (Exception ex)
             {
@@ -58,12 +64,7 @@ public sealed class CopilotToolBridgeInferenceBridge(
 
     public async ValueTask DisposeAsync()
     {
-        foreach (var pending in _pendingCalls.Values)
-        {
-            await pending.State.DisposeAsync();
-        }
-
-        _pendingCalls.Clear();
+        await pendingToolCalls.DisposeAsync();
     }
 
     private async Task StartCopilotTurnAsync(
@@ -113,7 +114,7 @@ public sealed class CopilotToolBridgeInferenceBridge(
 
             if (disposeState)
             {
-                RemovePendingCallsForState(state);
+                pendingToolCalls.RemoveForSession(state);
                 await state.DisposeAsync();
             }
         }
@@ -125,7 +126,11 @@ public sealed class CopilotToolBridgeInferenceBridge(
         CancellationToken cancellationToken)
     {
         var pending = pendingToolOutput.PendingCall;
-        var state = pending.State;
+        if (pending.Session is not CopilotBridgeState state)
+        {
+            throw new InvalidOperationException($"Pending Copilot tool call {pending.CallId} is not attached to a bridge session.");
+        }
+
         var exchange = new BridgeExchange(writer);
         var disposeState = false;
         var gateHeld = false;
@@ -134,11 +139,6 @@ public sealed class CopilotToolBridgeInferenceBridge(
         {
             await state.Gate.WaitAsync(cancellationToken);
             gateHeld = true;
-
-            if (!_pendingCalls.TryRemove(pending.CallId, out _))
-            {
-                throw new InvalidOperationException($"Pending Copilot tool call {pending.CallId} was already consumed.");
-            }
 
             state.MarkToolOutputSubmitted(pending);
             state.OpenExchange(exchange);
@@ -177,7 +177,7 @@ public sealed class CopilotToolBridgeInferenceBridge(
 
             if (disposeState)
             {
-                RemovePendingCallsForState(state);
+                pendingToolCalls.RemoveForSession(state);
                 await state.DisposeAsync();
             }
         }
@@ -215,7 +215,7 @@ public sealed class CopilotToolBridgeInferenceBridge(
         }
 
         var session = await client.CreateSessionAsync(config, cancellationToken);
-        var state = new CopilotBridgeState(client, session, tools);
+        var state = new CopilotBridgeState(client, session, tools, model);
         session.On<SessionEvent>(evt => HandleSessionEvent(state, evt));
 
         logger.LogInformation("Started Copilot bridge session with {ToolCount} Codex tool declaration(s).", tools.Count);
@@ -263,6 +263,12 @@ public sealed class CopilotToolBridgeInferenceBridge(
             return;
         }
 
+        if (string.IsNullOrWhiteSpace(request.RequestId))
+        {
+            exchange.Done.TrySetException(new InvalidOperationException("Copilot requested an external tool without a request id."));
+            return;
+        }
+
         if (!state.ToolsByCopilotName.TryGetValue(request.ToolName, out var tool))
         {
             exchange.Done.TrySetException(new InvalidOperationException($"Copilot requested unknown external tool {request.ToolName}."));
@@ -270,10 +276,10 @@ public sealed class CopilotToolBridgeInferenceBridge(
         }
 
         var callId = CreateUniqueCallId(request);
-        var pending = new PendingToolCall(callId, request.RequestId, state, tool);
+        var pending = new PendingToolCall(callId, request.RequestId, state, tool, DateTimeOffset.UtcNow);
         state.MarkWaitingForToolOutput(pending);
 
-        if (!_pendingCalls.TryAdd(callId, pending))
+        if (!pendingToolCalls.TryAdd(pending))
         {
             exchange.Done.TrySetException(new InvalidOperationException($"Could not register pending Copilot tool call {callId}."));
             return;
@@ -290,35 +296,6 @@ public sealed class CopilotToolBridgeInferenceBridge(
             RenderArguments(request),
             tool.CodexNamespace));
         exchange.Done.TrySetResult();
-    }
-
-    private bool TryFindPendingToolOutput(ResponsesApiRequest request, out PendingToolOutput pendingToolOutput)
-    {
-        foreach (var pending in _pendingCalls.Values)
-        {
-            var output = ToolOutputReader.FindTextOutput(request, pending.CallId);
-            if (output is null)
-            {
-                continue;
-            }
-
-            pendingToolOutput = new PendingToolOutput(pending, output);
-            return true;
-        }
-
-        pendingToolOutput = null!;
-        return false;
-    }
-
-    private void RemovePendingCallsForState(CopilotBridgeState state)
-    {
-        foreach (var pending in _pendingCalls)
-        {
-            if (ReferenceEquals(pending.Value.State, state))
-            {
-                _pendingCalls.TryRemove(pending.Key, out _);
-            }
-        }
     }
 
     private static AIFunctionDeclaration CreateCopilotToolDeclaration(CodexToolDeclaration tool) =>
@@ -342,7 +319,7 @@ public sealed class CopilotToolBridgeInferenceBridge(
             ? request.ToolCallId
             : request.RequestId ?? Guid.NewGuid().ToString("N");
         var callId = $"copilot_{SanitizeCallId(seed)}";
-        if (!_pendingCalls.ContainsKey(callId))
+        if (!pendingToolCalls.ContainsCallId(callId))
         {
             return callId;
         }
@@ -361,6 +338,9 @@ public sealed class CopilotToolBridgeInferenceBridge(
         return builder.Length == 0 ? Guid.NewGuid().ToString("N") : builder.ToString();
     }
 
+    private static TimeSpan Positive(TimeSpan value, TimeSpan fallback) =>
+        value > TimeSpan.Zero ? value : fallback;
+
     private string? ResolveCopilotHome()
     {
         if (!string.IsNullOrWhiteSpace(options.Value.CopilotHome))
@@ -374,14 +354,6 @@ public sealed class CopilotToolBridgeInferenceBridge(
             : Path.Combine(home, ".codex-copilot-bridge", "copilot-home");
     }
 
-    private sealed record PendingToolOutput(PendingToolCall PendingCall, string Output);
-
-    private sealed record PendingToolCall(
-        string CallId,
-        string CopilotRequestId,
-        CopilotBridgeState State,
-        CodexToolDeclaration Tool);
-
     private sealed class BridgeExchange(ChannelWriter<BridgeOutput> writer)
     {
         public ChannelWriter<BridgeOutput> Writer { get; } = writer;
@@ -392,7 +364,8 @@ public sealed class CopilotToolBridgeInferenceBridge(
     private sealed class CopilotBridgeState(
         CopilotClient client,
         CopilotSession session,
-        IReadOnlyList<CodexToolDeclaration> tools) : IAsyncDisposable
+        IReadOnlyList<CodexToolDeclaration> tools,
+        string model) : IPendingBridgeSession
     {
         private readonly object _sync = new();
         private bool _disposed;
@@ -401,6 +374,8 @@ public sealed class CopilotToolBridgeInferenceBridge(
         public CopilotClient Client { get; } = client;
 
         public CopilotSession Session { get; } = session;
+
+        public string Model { get; } = model;
 
         public SemaphoreSlim Gate { get; } = new(1, 1);
 

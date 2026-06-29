@@ -98,7 +98,7 @@ codex exec \
 - [x] Map Copilot assistant deltas to `response.output_text.delta`.
 - [x] Map Copilot final assistant messages to `response.output_item.done`.
 - [x] Map Copilot completion/idle events to `response.completed`.
-- [ ] Add cancellation and timeout handling.
+- [x] Add cancellation and timeout handling.
 
 ### 3. Codex Tool Loop Spike
 
@@ -119,7 +119,17 @@ codex exec \
 - [x] Convert Copilot external tool requests to Codex Responses tool-call items.
 - [x] Correlate pending Copilot tool calls with Codex follow-up requests.
 - [x] Send Codex tool outputs back into the Copilot session.
-- [ ] Add session cleanup and idle expiration.
+- [x] Add session cleanup and idle expiration.
+
+### 6. Lifecycle Hardening
+
+- [x] Centralize pending tool calls in a store.
+- [x] Add request timeout handling.
+- [x] Add pending tool-call TTL cleanup.
+- [x] Expose pending-call and active-session counts from `/healthz`.
+- [x] Add tests for store removal, expiry, and snapshots.
+- [ ] Add structured metrics export.
+- [ ] Add CI packaging and release artifacts.
 
 ## Safety Rules
 
@@ -139,4 +149,6 @@ The Copilot external-tool probe is verified: the high-level GitHub Copilot SDK c
 
 The initial full bridge loop is verified: when Copilot requests an external tool, the bridge emits a Codex `function_call` item, persists the pending Copilot request, reads Codex's follow-up `function_call_output`, submits that output back to Copilot, and continues the Copilot session to final text. The live smoke used `codex exec -m gpt-5.5`; Copilot requested Codex's `exec_command` tool, Codex executed `printf "codex-copilot-full-loop-ok"`, and Copilot returned `codex-copilot-full-loop-ok` as the final message.
 
-The next production-relevant slice is lifecycle hardening: pending-session idle expiration, request timeouts, health/metrics for active sessions, and tests around error cleanup.
+Lifecycle hardening is now implemented for in-memory state: pending calls are centralized in a store, active operations have a request timeout, pending tool calls expire after a TTL, expired Copilot sessions are disposed by a hosted cleanup service, and `/healthz` reports pending-call and active-session counts. Store lifecycle behavior is covered by unit tests.
+
+The next production-relevant slice is packaging and operations: a release build, install script or Homebrew formula, launchd service template for macOS, and CI that runs tests/builds on push.
