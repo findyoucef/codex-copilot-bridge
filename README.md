@@ -46,3 +46,23 @@ Bridge__Mode=ToolProbe dotnet run --project CodexCopilotBridge/CodexCopilotBridg
 ```
 
 Then point Codex at the bridge. The probe backend emits a `shell_command` function call, waits for Codex to execute it, and summarizes the returned `function_call_output`.
+
+Copilot external-tool probe:
+
+```bash
+Bridge__Mode=CopilotToolProbe dotnet run --project CodexCopilotBridge/CodexCopilotBridge.csproj --urls http://127.0.0.1:17776
+```
+
+This probe registers a declaration-only `bridge_echo` tool with Copilot, responds to the SDK's `external_tool.requested` event through the pending-tool RPC, and returns Copilot's final answer.
+
+Codex smoke command:
+
+```bash
+codex exec --ignore-user-config --skip-git-repo-check \
+  -c 'model_providers.github-copilot-bridge={ name="GitHub Copilot Bridge", base_url="http://127.0.0.1:17776/v1", wire_api="responses", requires_openai_auth=false, supports_websockets=false }' \
+  -c 'model_provider="github-copilot-bridge"' \
+  -m gpt-5.5 \
+  --json 'Run the Copilot external tool probe.'
+```
+
+Codex may warn that it has no built-in model metadata for `gpt-5.5`; the probe still verifies Copilot external-tool request/response handling.

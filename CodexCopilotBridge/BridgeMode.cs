@@ -4,5 +4,6 @@ public enum BridgeMode
 {
     Echo,
     CopilotSdk,
-    ToolProbe
+    ToolProbe,
+    CopilotToolProbe
 }

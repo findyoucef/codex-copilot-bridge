@@ -8,6 +8,7 @@ builder.Services.Configure<BridgeOptions>(builder.Configuration.GetSection("Brid
 builder.Services.AddSingleton<EchoInferenceBridge>();
 builder.Services.AddSingleton<CopilotSdkInferenceBridge>();
 builder.Services.AddSingleton<ToolProbeInferenceBridge>();
+builder.Services.AddSingleton<CopilotToolProbeInferenceBridge>();
 builder.Services.AddSingleton<IInferenceBridge>(services =>
 {
     var options = services.GetRequiredService<IOptions<BridgeOptions>>().Value;
@@ -15,6 +16,7 @@ builder.Services.AddSingleton<IInferenceBridge>(services =>
     {
         BridgeMode.CopilotSdk => services.GetRequiredService<CopilotSdkInferenceBridge>(),
         BridgeMode.ToolProbe => services.GetRequiredService<ToolProbeInferenceBridge>(),
+        BridgeMode.CopilotToolProbe => services.GetRequiredService<CopilotToolProbeInferenceBridge>(),
         _ => services.GetRequiredService<EchoInferenceBridge>()
     };
 });

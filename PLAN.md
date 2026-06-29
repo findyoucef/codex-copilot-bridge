@@ -108,10 +108,10 @@ codex exec \
 
 ### 4. Copilot External Tool Spike
 
-- [ ] Register one declaration-only Copilot tool.
-- [ ] Observe `external_tool.requested`.
-- [ ] Respond through the Copilot SDK pending tool-call API.
-- [ ] Decide whether the high-level SDK is sufficient or whether direct runtime RPC is needed.
+- [x] Register one declaration-only Copilot tool.
+- [x] Observe `external_tool.requested`.
+- [x] Respond through the Copilot SDK pending tool-call API.
+- [x] Decide whether the high-level SDK is sufficient or whether direct runtime RPC is needed.
 
 ### 5. Full Tool Bridge
 
@@ -132,3 +132,9 @@ codex exec \
 ## Current Implementation Status
 
 The first implementation is a runnable text-only bridge. It can serve Codex-compatible `/v1/models` metadata, stream a minimal Responses-compatible text turn from an echo adapter, and stream text-only answers from the GitHub Copilot SDK adapter. The Copilot SDK adapter is now the default runtime mode. Local verification showed `claude-sonnet-4.5` works with the installed Copilot runtime; `gpt-5` was rejected by that runtime as unavailable.
+
+The Codex tool-loop probe is verified: the bridge can emit a `shell_command` function call, Codex executes it, and the bridge receives the resulting `function_call_output`.
+
+The Copilot external-tool probe is verified: the high-level GitHub Copilot SDK can register a declaration-only tool, surface `external_tool.requested`, and accept a result through `HandlePendingToolCallAsync`. This path was verified directly over `/v1/responses` and through `codex exec -m gpt-5.5`. Codex currently warns that it has no built-in metadata for `gpt-5.5`, but the bridge request still completes.
+
+The next production-relevant slice is the full bridge loop: when Copilot requests an external tool, the bridge should emit a Codex `function_call` item, persist the pending Copilot request, read Codex's follow-up `function_call_output`, submit that output back to Copilot, and continue the Copilot session to final text.
