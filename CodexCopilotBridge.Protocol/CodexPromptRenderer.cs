@@ -5,7 +5,7 @@ namespace CodexCopilotBridge.Protocol;
 
 public static class CodexPromptRenderer
 {
-    public static string Render(ResponsesApiRequest request)
+    public static string Render(ResponsesApiRequest request, bool includeToolNotice = true)
     {
         var builder = new StringBuilder();
 
@@ -23,7 +23,7 @@ public static class CodexPromptRenderer
             AppendInputItem(builder, item);
         }
 
-        if (request.Tools is { Count: > 0 })
+        if (includeToolNotice && request.Tools is { Count: > 0 })
         {
             builder.AppendLine();
             builder.AppendLine($"Codex supplied {request.Tools.Count} tool declaration(s). Tool bridging is not enabled in this build.");

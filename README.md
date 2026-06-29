@@ -8,6 +8,8 @@ Local bridge for experimenting with GitHub Copilot as a Codex CLI inference prov
 dotnet run --project CodexCopilotBridge/CodexCopilotBridge.csproj --urls http://127.0.0.1:17776
 ```
 
+The default mode is `CopilotBridge`: Codex sends its tool declarations to the bridge, Copilot can request those declaration-only tools, and Codex remains the executor for shell, filesystem, MCP, and other tool calls.
+
 ## Codex Provider Config
 
 ```toml
@@ -23,9 +25,23 @@ model_provider = "github-copilot-bridge"
 model = "claude-sonnet-4.5"
 ```
 
-## Development Mode
+## Smoke Test
 
-The host uses the GitHub Copilot SDK backend by default. Set `Bridge:Mode` to `Echo` to test the Codex provider contract without spending Copilot quota or depending on auth state.
+```bash
+codex exec --ignore-user-config --skip-git-repo-check \
+  -c 'model_providers.github-copilot-bridge={ name="GitHub Copilot Bridge", base_url="http://127.0.0.1:17776/v1", wire_api="responses", requires_openai_auth=false, supports_websockets=false }' \
+  -c 'model_provider="github-copilot-bridge"' \
+  -m gpt-5.5 \
+  --json 'Use the shell_command tool to run: printf "codex-copilot-full-loop-ok". Then reply with exactly the command output and no other text.'
+```
+
+Expected result: Codex executes the command, then the final assistant message is `codex-copilot-full-loop-ok`. Codex may warn that it has no built-in model metadata for `gpt-5.5`; the bridge call still completes.
+
+## Development Modes
+
+Set `Bridge:Mode` to `Echo` to test the Codex provider contract without spending Copilot quota or depending on auth state.
+
+Set `Bridge:Mode` to `CopilotSdk` for text-only Copilot streaming without tool bridging.
 
 The installed Copilot runtime on this machine accepted `claude-sonnet-4.5` and rejected `gpt-5` as unavailable during verification.
 

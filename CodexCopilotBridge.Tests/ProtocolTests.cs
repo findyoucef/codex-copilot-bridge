@@ -108,6 +108,31 @@ public sealed class ProtocolTests
     }
 
     [Fact]
+    public void PromptRenderer_CanOmitDisabledToolNotice()
+    {
+        var request = JsonSerializer.Deserialize<ResponsesApiRequest>(
+            """
+            {
+              "model": "gpt-5",
+              "input": [],
+              "tools": [
+                {
+                  "type": "function",
+                  "name": "shell_command",
+                  "description": "Run a command.",
+                  "parameters": { "type": "object", "properties": {} }
+                }
+              ]
+            }
+            """,
+            ProtocolJson.SerializerOptions);
+
+        var prompt = CodexPromptRenderer.Render(request!, includeToolNotice: false);
+
+        Assert.DoesNotContain("Tool bridging is not enabled", prompt);
+    }
+
+    [Fact]
     public void ToolOutputReader_FindsFunctionCallOutputText()
     {
         var request = JsonSerializer.Deserialize<ResponsesApiRequest>(
@@ -128,5 +153,105 @@ public sealed class ProtocolTests
         var output = ToolOutputReader.FindTextOutput(request!, "call_1");
 
         Assert.Equal("tool output", output);
+    }
+
+    [Fact]
+    public void ToolOutputReader_FindsFirstOutputCallId()
+    {
+        var request = JsonSerializer.Deserialize<ResponsesApiRequest>(
+            """
+            {
+              "model": "gpt-5",
+              "input": [
+                {
+                  "type": "function_call_output",
+                  "call_id": "call_1",
+                  "output": "tool output"
+                }
+              ]
+            }
+            """,
+            ProtocolJson.SerializerOptions);
+
+        var callId = ToolOutputReader.FindFirstOutputCallId(request!);
+
+        Assert.Equal("call_1", callId);
+    }
+
+    [Fact]
+    public void CodexToolReader_ReadsTopLevelFunctionTools()
+    {
+        var request = JsonSerializer.Deserialize<ResponsesApiRequest>(
+            """
+            {
+              "model": "gpt-5",
+              "input": [],
+              "tools": [
+                {
+                  "type": "function",
+                  "name": "shell_command",
+                  "description": "Run a command.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "command": { "type": "string" }
+                    }
+                  }
+                }
+              ]
+            }
+            """,
+            ProtocolJson.SerializerOptions);
+
+        var tools = CodexToolReader.ReadToolDeclarations(request!);
+
+        var tool = Assert.Single(tools);
+        Assert.Equal("shell_command", tool.CopilotName);
+        Assert.Equal("shell_command", tool.CodexName);
+        Assert.Null(tool.CodexNamespace);
+        Assert.Equal("Run a command.", tool.Description);
+        Assert.Equal("object", tool.Parameters.GetProperty("type").GetString());
+    }
+
+    [Fact]
+    public void CodexToolReader_FlattensNamespaceFunctionTools()
+    {
+        var request = JsonSerializer.Deserialize<ResponsesApiRequest>(
+            """
+            {
+              "model": "gpt-5",
+              "input": [],
+              "tools": [
+                {
+                  "type": "namespace",
+                  "name": "mcp__demo__",
+                  "description": "Demo tools.",
+                  "tools": [
+                    {
+                      "type": "function",
+                      "name": "lookup_order",
+                      "description": "Look up an order.",
+                      "parameters": {
+                        "type": "object",
+                        "properties": {
+                          "order_id": { "type": "string" }
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+            """,
+            ProtocolJson.SerializerOptions);
+
+        var tools = CodexToolReader.ReadToolDeclarations(request!);
+
+        var tool = Assert.Single(tools);
+        Assert.Equal("mcp__demo__lookup_order", tool.CopilotName);
+        Assert.Equal("lookup_order", tool.CodexName);
+        Assert.Equal("mcp__demo__", tool.CodexNamespace);
+        Assert.Contains("Demo tools.", tool.Description);
+        Assert.Contains("Look up an order.", tool.Description);
     }
 }

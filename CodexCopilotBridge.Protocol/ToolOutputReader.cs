@@ -4,17 +4,29 @@ namespace CodexCopilotBridge.Protocol;
 
 public static class ToolOutputReader
 {
-    public static string? FindTextOutput(ResponsesApiRequest request, string callId)
+    public static string? FindFirstOutputCallId(ResponsesApiRequest request)
     {
         foreach (var item in request.Input)
         {
-            if (!item.TryGetProperty("type", out var typeElement))
+            if (!IsToolOutput(item))
             {
                 continue;
             }
 
-            var type = typeElement.GetString();
-            if (type is not ("function_call_output" or "custom_tool_call_output"))
+            if (item.TryGetProperty("call_id", out var callIdElement))
+            {
+                return callIdElement.GetString();
+            }
+        }
+
+        return null;
+    }
+
+    public static string? FindTextOutput(ResponsesApiRequest request, string callId)
+    {
+        foreach (var item in request.Input)
+        {
+            if (!IsToolOutput(item))
             {
                 continue;
             }
@@ -34,6 +46,16 @@ public static class ToolOutputReader
         }
 
         return null;
+    }
+
+    private static bool IsToolOutput(JsonElement item)
+    {
+        if (!item.TryGetProperty("type", out var typeElement))
+        {
+            return false;
+        }
+
+        return typeElement.GetString() is "function_call_output" or "custom_tool_call_output";
     }
 
     private static string OutputToText(JsonElement output) =>
