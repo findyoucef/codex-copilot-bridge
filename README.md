@@ -2,15 +2,232 @@
 
 Local bridge for experimenting with GitHub Copilot as a Codex CLI inference provider.
 
-## Run
+## Quick Setup on macOS
+
+Prerequisites:
+
+- macOS arm64.
+- GitHub account with Copilot access.
+- `codex` CLI installed and working.
+- `gh` CLI authenticated to GitHub if installing from GitHub Actions artifacts.
+
+The default bridge mode is `CopilotBridge`: Codex sends its tool declarations to the bridge, Copilot can request those declaration-only tools, and Codex remains the executor for shell, filesystem, MCP, and other tool calls.
+
+### 1. Install the launchd service from GitHub
+
+```bash
+REPO=findyoucef/codex-copilot-bridge
+WORKDIR="$(mktemp -d)"
+cd "$WORKDIR"
+
+RUN_ID="$(gh run list \
+  --repo "$REPO" \
+  --branch main \
+  --workflow ci.yml \
+  --status success \
+  --limit 1 \
+  --json databaseId \
+  --jq '.[0].databaseId')"
+
+gh run download "$RUN_ID" \
+  --repo "$REPO" \
+  --name codex-copilot-bridge-osx-arm64
+
+tar -xzf codex-copilot-bridge-osx-arm64.tar.gz
+
+mkdir -p scripts ops/launchd
+
+gh api "repos/$REPO/contents/scripts/install-macos-launchd.sh?ref=main" \
+  --jq .content | base64 -D > scripts/install-macos-launchd.sh
+
+gh api "repos/$REPO/contents/scripts/uninstall-macos-launchd.sh?ref=main" \
+  --jq .content | base64 -D > scripts/uninstall-macos-launchd.sh
+
+gh api "repos/$REPO/contents/ops/launchd/com.findyoucef.codex-copilot-bridge.plist?ref=main" \
+  --jq .content | base64 -D > ops/launchd/com.findyoucef.codex-copilot-bridge.plist
+
+chmod +x scripts/*.sh
+scripts/install-macos-launchd.sh ./codex-copilot-bridge-osx-arm64
+```
+
+Verify the service:
+
+```bash
+curl -fsS http://127.0.0.1:17776/healthz
+launchctl print "gui/$(id -u)/com.findyoucef.codex-copilot-bridge"
+```
+
+Logs are written to:
+
+```text
+~/Library/Logs/codex-copilot-bridge/stdout.log
+~/Library/Logs/codex-copilot-bridge/stderr.log
+```
+
+If the GitHub Actions artifact has expired, clone the repository and build locally instead:
+
+```bash
+git clone https://github.com/findyoucef/codex-copilot-bridge.git
+cd codex-copilot-bridge
+scripts/publish-osx-arm64.sh
+scripts/install-macos-launchd.sh
+```
+
+### 2. Authenticate Copilot for the bridge
+
+The bridge uses an isolated Copilot home at `~/.codex-copilot-bridge/copilot-home`. Authenticate that home once:
+
+```bash
+COPILOT_BIN="$HOME/.local/share/codex-copilot-bridge/runtimes/osx-arm64/native/copilot"
+COPILOT_HOME="$HOME/.codex-copilot-bridge/copilot-home" "$COPILOT_BIN" login
+```
+
+The command opens GitHub's device login flow and prints a code. Complete the browser step before running Codex through the bridge.
+
+### 3. Add a Codex profile
+
+Codex profiles live in `~/.codex/<profile-name>.config.toml`. Create a `copilot-bridge` profile:
+
+```bash
+mkdir -p "$HOME/.codex"
+
+cat > "$HOME/.codex/copilot-bridge.config.toml" <<'EOF'
+model = "gpt-5.5"
+model_provider = "github-copilot-bridge"
+model_reasoning_effort = "medium"
+
+[model_providers.github-copilot-bridge]
+name = "GitHub Copilot Bridge"
+base_url = "http://127.0.0.1:17776/v1"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+stream_idle_timeout_ms = 600000
+EOF
+```
+
+Use the profile directly:
+
+```bash
+codex --profile copilot-bridge
+codex exec --profile copilot-bridge "Reply exactly: copilot-profile-ok"
+```
+
+Plain `codex` and `codex exec` still use your normal Codex provider.
+
+### 4. Optional zsh helpers
+
+These helpers make switching explicit without changing your default Codex config:
+
+```bash
+cat > "$HOME/.codex-copilot-bridge.zsh" <<'EOF'
+codex-copilot() {
+  command codex --profile copilot-bridge "$@"
+}
+
+codex-copilot-exec() {
+  command codex exec --profile copilot-bridge "$@"
+}
+
+codex-default() {
+  command codex "$@"
+}
+
+codex-default-exec() {
+  command codex exec "$@"
+}
+
+codex-copilot-health() {
+  curl -fsS http://127.0.0.1:17776/healthz
+  printf '\n'
+}
+EOF
+
+if ! grep -q 'codex-copilot-bridge' "$HOME/.zshrc"; then
+  cat >> "$HOME/.zshrc" <<'EOF'
+
+# >>> codex-copilot-bridge >>>
+if [ -f "$HOME/.codex-copilot-bridge.zsh" ]; then
+  source "$HOME/.codex-copilot-bridge.zsh"
+fi
+# <<< codex-copilot-bridge <<<
+EOF
+fi
+
+source "$HOME/.zshrc"
+```
+
+Use Copilot-backed Codex:
+
+```bash
+codex-copilot
+codex-copilot-exec "Reply exactly: copilot-profile-ok"
+codex-copilot-health
+```
+
+Switch back to the default provider:
+
+```bash
+codex
+codex exec "Reply with the active model name."
+
+# Or, if you prefer explicit helper names:
+codex-default
+codex-default-exec "Reply with the active model name."
+```
+
+### 5. Smoke test the full tool loop
+
+This test verifies the important path: Copilot requests a tool, Codex executes it, and the bridge returns the tool output back to Copilot.
+
+```bash
+codex exec --profile copilot-bridge --skip-git-repo-check \
+  --output-last-message /tmp/codex-copilot-tool-smoke.out \
+  'Use the shell_command tool to run: printf codex-copilot-tool-ok. Then reply with exactly the command output and no other text.'
+
+cat /tmp/codex-copilot-tool-smoke.out
+```
+
+Expected output:
+
+```text
+codex-copilot-tool-ok
+```
+
+## Service Management
+
+Useful install overrides:
+
+```bash
+CODEX_COPILOT_BRIDGE_PORT=17776 \
+CODEX_COPILOT_BRIDGE_INSTALL_DIR="$HOME/.local/share/codex-copilot-bridge" \
+CODEX_COPILOT_BRIDGE_LOG_DIR="$HOME/Library/Logs/codex-copilot-bridge" \
+scripts/install-macos-launchd.sh
+```
+
+Uninstall the launchd service:
+
+```bash
+scripts/uninstall-macos-launchd.sh
+```
+
+Remove installed files and logs too:
+
+```bash
+scripts/uninstall-macos-launchd.sh --remove-files
+```
+
+The health response includes `pending_tool_calls`, `active_copilot_sessions`, `oldest_pending_tool_call_age_seconds`, `pending_tool_call_ttl_seconds`, and `request_timeout_seconds`.
+
+## Development
+
+Run from source:
 
 ```bash
 dotnet run --project CodexCopilotBridge/CodexCopilotBridge.csproj --urls http://127.0.0.1:17776
 ```
 
-The default mode is `CopilotBridge`: Codex sends its tool declarations to the bridge, Copilot can request those declaration-only tools, and Codex remains the executor for shell, filesystem, MCP, and other tool calls.
-
-## Package
+Package locally:
 
 ```bash
 scripts/publish-osx-arm64.sh
@@ -25,84 +242,13 @@ artifacts/dist/codex-copilot-bridge-osx-arm64.tar.gz
 
 The archive is also produced by GitHub Actions on pushes to `main`.
 
-## macOS Service
-
-Install the latest local publish as a launchd user service:
-
-```bash
-scripts/install-macos-launchd.sh
-```
-
-To install from the CI tarball, extract it first and pass the extracted publish directory:
-
-```bash
-tar -xzf codex-copilot-bridge-osx-arm64.tar.gz
-scripts/install-macos-launchd.sh ./codex-copilot-bridge-osx-arm64
-```
-
-Useful overrides:
-
-```bash
-CODEX_COPILOT_BRIDGE_PORT=17776 \
-CODEX_COPILOT_BRIDGE_INSTALL_DIR="$HOME/.local/share/codex-copilot-bridge" \
-CODEX_COPILOT_BRIDGE_LOG_DIR="$HOME/Library/Logs/codex-copilot-bridge" \
-scripts/install-macos-launchd.sh
-```
-
-Uninstall:
-
-```bash
-scripts/uninstall-macos-launchd.sh
-```
-
-Remove installed files and logs too:
-
-```bash
-scripts/uninstall-macos-launchd.sh --remove-files
-```
-
-## Health
-
-```bash
-curl http://127.0.0.1:17776/healthz
-```
-
-The health response includes `pending_tool_calls`, `active_copilot_sessions`, `oldest_pending_tool_call_age_seconds`, `pending_tool_call_ttl_seconds`, and `request_timeout_seconds`.
-
-## Codex Provider Config
-
-```toml
-[model_providers.github-copilot-bridge]
-name = "GitHub Copilot Bridge"
-base_url = "http://127.0.0.1:17776/v1"
-wire_api = "responses"
-requires_openai_auth = false
-supports_websockets = false
-stream_idle_timeout_ms = 600000
-
-model_provider = "github-copilot-bridge"
-model = "claude-sonnet-4.5"
-```
-
-## Smoke Test
-
-```bash
-codex exec --ignore-user-config --skip-git-repo-check \
-  -c 'model_providers.github-copilot-bridge={ name="GitHub Copilot Bridge", base_url="http://127.0.0.1:17776/v1", wire_api="responses", requires_openai_auth=false, supports_websockets=false }' \
-  -c 'model_provider="github-copilot-bridge"' \
-  -m gpt-5.5 \
-  --json 'Use the shell_command tool to run: printf "codex-copilot-full-loop-ok". Then reply with exactly the command output and no other text.'
-```
-
-Expected result: Codex executes the command, then the final assistant message is `codex-copilot-full-loop-ok`. Codex may warn that it has no built-in model metadata for `gpt-5.5`; the bridge call still completes.
-
 ## Development Modes
 
 Set `Bridge:Mode` to `Echo` to test the Codex provider contract without spending Copilot quota or depending on auth state.
 
 Set `Bridge:Mode` to `CopilotSdk` for text-only Copilot streaming without tool bridging.
 
-The installed Copilot runtime on this machine accepted `claude-sonnet-4.5` and rejected `gpt-5` as unavailable during verification.
+The default profile and bridge fallback use `gpt-5.5`. If Copilot rejects that model for your account, set the profile `model` and `Bridge:DefaultModel` to another Copilot-supported model slug.
 
 ```bash
 dotnet test
@@ -133,14 +279,11 @@ This probe registers a declaration-only `bridge_echo` tool with Copilot, respond
 Codex smoke command:
 
 ```bash
-codex exec --ignore-user-config --skip-git-repo-check \
-  -c 'model_providers.github-copilot-bridge={ name="GitHub Copilot Bridge", base_url="http://127.0.0.1:17776/v1", wire_api="responses", requires_openai_auth=false, supports_websockets=false }' \
-  -c 'model_provider="github-copilot-bridge"' \
-  -m gpt-5.5 \
+codex exec --profile copilot-bridge --skip-git-repo-check \
   --json 'Run the Copilot external tool probe.'
 ```
 
-Codex may warn that it has no built-in model metadata for `gpt-5.5`; the probe still verifies Copilot external-tool request/response handling.
+The probe verifies Copilot external-tool request/response handling through the same provider profile used in the quick setup.
 
 ## Lifecycle Settings
 
