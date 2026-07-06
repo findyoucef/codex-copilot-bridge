@@ -51,26 +51,49 @@ internal sealed class PendingToolCallStore(ILogger<PendingToolCallStore> logger)
 
     public bool ContainsCallId(string callId) => _pendingCalls.ContainsKey(callId);
 
-    public bool TryTakeOutput(ResponsesApiRequest request, out PendingToolOutput pendingToolOutput)
+    public bool TryTakeOutputs(ResponsesApiRequest request, out IReadOnlyList<PendingToolOutput> pendingToolOutputs)
     {
-        foreach (var pending in _pendingCalls.Values)
+        var matches = _pendingCalls.Values
+            .Select(pending => new
+            {
+                Pending = pending,
+                Output = ToolOutputReader.FindTextOutput(request, pending.CallId)
+            })
+            .Where(match => match.Output is not null)
+            .ToArray();
+
+        if (matches.Length == 0)
         {
-            var output = ToolOutputReader.FindTextOutput(request, pending.CallId);
-            if (output is null)
+            pendingToolOutputs = [];
+            return false;
+        }
+
+        var sessionCounts = new Dictionary<IPendingBridgeSession, int>(ReferenceEqualityComparer.Instance);
+        foreach (var match in matches)
+        {
+            sessionCounts.TryGetValue(match.Pending.Session, out var count);
+            sessionCounts[match.Pending.Session] = count + 1;
+        }
+
+        var session = sessionCounts.MaxBy(match => match.Value).Key;
+        var outputs = new List<PendingToolOutput>();
+
+        foreach (var match in matches)
+        {
+            if (!ReferenceEquals(match.Pending.Session, session))
             {
                 continue;
             }
 
-            if (_pendingCalls.TryRemove(pending.CallId, out var removed))
+            if (_pendingCalls.TryRemove(match.Pending.CallId, out var removed))
             {
                 removed.Touch(DateTimeOffset.UtcNow);
-                pendingToolOutput = new PendingToolOutput(removed, output);
-                return true;
+                outputs.Add(new PendingToolOutput(removed, match.Output!));
             }
         }
 
-        pendingToolOutput = null!;
-        return false;
+        pendingToolOutputs = outputs;
+        return outputs.Count > 0;
     }
 
     public int RemoveForSession(IPendingBridgeSession session)
@@ -111,7 +134,7 @@ internal sealed class PendingToolCallStore(ILogger<PendingToolCallStore> logger)
     {
         if (ttl <= TimeSpan.Zero)
         {
-            ttl = TimeSpan.FromMinutes(10);
+            ttl = TimeSpan.FromHours(1);
         }
 
         var expired = _pendingCalls

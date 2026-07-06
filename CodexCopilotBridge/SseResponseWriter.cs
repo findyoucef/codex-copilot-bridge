@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using CodexCopilotBridge.Inference;
 using CodexCopilotBridge.Protocol;
@@ -13,8 +14,10 @@ public static class SseResponseWriter
         CancellationToken cancellationToken)
     {
         var responseId = $"resp_{Guid.NewGuid():N}";
-        var finalText = string.Empty;
+        var text = new StringBuilder();
+        string? finalText = null;
         var textItemStarted = false;
+        var contentPartStarted = false;
         var emittedText = false;
         var emittedToolCall = false;
 
@@ -39,13 +42,23 @@ public static class SseResponseWriter
                             textItemStarted = true;
                         }
 
-                        finalText += delta.Delta;
+                        if (!contentPartStarted)
+                        {
+                            await WriteEventAsync(context, "response.content_part.added", ResponsesEvents.ContentPartAdded(responseId), cancellationToken);
+                            contentPartStarted = true;
+                        }
+
+                        text.Append(delta.Delta);
                         emittedText = true;
-                        await WriteEventAsync(context, "response.output_text.delta", ResponsesEvents.OutputTextDelta(delta.Delta), cancellationToken);
+                        await WriteEventAsync(context, "response.output_text.delta", ResponsesEvents.OutputTextDelta(responseId, delta.Delta), cancellationToken);
                         break;
                     case FinalTextOutput final:
-                        finalText = final.Text;
-                        emittedText = !string.IsNullOrEmpty(finalText);
+                        if (!string.IsNullOrEmpty(final.Text) || text.Length == 0)
+                        {
+                            finalText = final.Text;
+                        }
+
+                        emittedText = emittedText || !string.IsNullOrEmpty(final.Text);
                         break;
                     case FunctionCallRequestOutput functionCall:
                         emittedToolCall = true;
@@ -64,12 +77,22 @@ public static class SseResponseWriter
 
             if (emittedText)
             {
+                var completedText = finalText ?? text.ToString();
+
                 if (!textItemStarted)
                 {
                     await WriteEventAsync(context, "response.output_item.added", ResponsesEvents.OutputMessageAdded(responseId), cancellationToken);
+                    textItemStarted = true;
                 }
 
-                await WriteEventAsync(context, "response.output_item.done", ResponsesEvents.OutputMessageDone(responseId, finalText), cancellationToken);
+                if (!contentPartStarted)
+                {
+                    await WriteEventAsync(context, "response.content_part.added", ResponsesEvents.ContentPartAdded(responseId), cancellationToken);
+                }
+
+                await WriteEventAsync(context, "response.output_text.done", ResponsesEvents.OutputTextDone(responseId, completedText), cancellationToken);
+                await WriteEventAsync(context, "response.content_part.done", ResponsesEvents.ContentPartDone(responseId, completedText), cancellationToken);
+                await WriteEventAsync(context, "response.output_item.done", ResponsesEvents.OutputMessageDone(responseId, completedText), cancellationToken);
             }
 
             await WriteEventAsync(context, "response.completed", ResponsesEvents.Completed(responseId, endTurn: !emittedToolCall), cancellationToken);

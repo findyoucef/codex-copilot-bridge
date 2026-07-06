@@ -17,7 +17,7 @@ internal sealed class PendingToolCallCleanupService(
                 await Task.Delay(interval, stoppingToken);
                 var expired = await pendingToolCalls.ExpireAsync(
                     DateTimeOffset.UtcNow,
-                    Positive(options.Value.PendingToolCallTtl, TimeSpan.FromMinutes(10)),
+                    Positive(options.Value.PendingToolCallTtl, TimeSpan.FromHours(1)),
                     stoppingToken);
 
                 if (expired > 0)

@@ -102,7 +102,7 @@ base_url = "http://127.0.0.1:17776/v1"
 wire_api = "responses"
 requires_openai_auth = false
 supports_websockets = false
-stream_idle_timeout_ms = 600000
+stream_idle_timeout_ms = 3600000
 EOF
 ```
 
@@ -290,14 +290,16 @@ The probe verifies Copilot external-tool request/response handling through the s
 ```json
 {
   "Bridge": {
-    "RequestTimeout": "00:02:00",
-    "PendingToolCallTtl": "00:10:00",
-    "PendingToolCallCleanupInterval": "00:01:00"
+    "RequestTimeout": "01:00:00",
+    "PendingToolCallTtl": "01:00:00",
+    "PendingToolCallCleanupInterval": "00:01:00",
+    "ToolRequestBatchQuietPeriod": "00:00:00.500",
+    "ResponseOutputChannelCapacity": 512
   }
 }
 ```
 
-`RequestTimeout` caps each active `/v1/responses` bridge operation. `PendingToolCallTtl` caps how long a Copilot session can wait for Codex to return tool output. The cleanup service disposes expired sessions on `PendingToolCallCleanupInterval`.
+`RequestTimeout` caps each active `/v1/responses` bridge operation. `PendingToolCallTtl` caps how long a Copilot session can wait for Codex to return tool output, including long-running local shell commands. The cleanup service disposes expired sessions on `PendingToolCallCleanupInterval`. `ToolRequestBatchQuietPeriod` waits briefly for adjacent parallel Copilot tool calls before returning them to Codex. `ResponseOutputChannelCapacity` bounds queued stream events so slow clients apply backpressure instead of allowing unbounded memory growth.
 
 ## CI
 

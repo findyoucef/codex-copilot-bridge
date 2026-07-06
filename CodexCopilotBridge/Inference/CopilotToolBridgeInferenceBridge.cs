@@ -12,32 +12,27 @@ internal sealed class CopilotToolBridgeInferenceBridge(
     PendingToolCallStore pendingToolCalls,
     ILogger<CopilotToolBridgeInferenceBridge> logger) : IInferenceBridge, IAsyncDisposable
 {
+    private static readonly TimeSpan DefaultToolRequestBatchQuietPeriod = TimeSpan.FromMilliseconds(500);
+    private readonly SemaphoreSlim _clientGate = new(1, 1);
+    private CopilotClient? _client;
+
     public async IAsyncEnumerable<BridgeOutput> CreateResponseAsync(
         ResponsesApiRequest request,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        var channel = Channel.CreateUnbounded<BridgeOutput>(
-            new UnboundedChannelOptions
-            {
-                SingleReader = true,
-                SingleWriter = false
-            });
+        var channel = BridgeOutputChannels.CreateBounded(options.Value.ResponseOutputChannelCapacity);
 
         _ = Task.Run(async () =>
         {
-            var requestTimeout = Positive(options.Value.RequestTimeout, TimeSpan.FromMinutes(2));
+            var requestTimeout = Positive(options.Value.RequestTimeout, TimeSpan.FromHours(1));
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             timeout.CancelAfter(requestTimeout);
 
             try
             {
-                if (pendingToolCalls.TryTakeOutput(request, out var pendingToolOutput))
+                if (pendingToolCalls.TryTakeOutputs(request, out var pendingToolOutputs))
                 {
-                    await ContinuePendingToolCallAsync(pendingToolOutput, channel.Writer, timeout.Token);
-                }
-                else if (ToolOutputReader.FindFirstOutputCallId(request) is { } orphanedCallId)
-                {
-                    throw new InvalidOperationException($"No pending Copilot tool call matched Codex output call id {orphanedCallId}.");
+                    await ContinuePendingToolCallsAsync(pendingToolOutputs, channel.Writer, timeout.Token);
                 }
                 else
                 {
@@ -65,6 +60,21 @@ internal sealed class CopilotToolBridgeInferenceBridge(
     public async ValueTask DisposeAsync()
     {
         await pendingToolCalls.DisposeAsync();
+
+        await _clientGate.WaitAsync();
+        try
+        {
+            if (_client is not null)
+            {
+                await _client.DisposeAsync();
+                _client = null;
+            }
+        }
+        finally
+        {
+            _clientGate.Release();
+            _clientGate.Dispose();
+        }
     }
 
     private async Task StartCopilotTurnAsync(
@@ -74,7 +84,7 @@ internal sealed class CopilotToolBridgeInferenceBridge(
     {
         var tools = CodexToolReader.ReadToolDeclarations(request);
         var state = await CreateCopilotStateAsync(request, tools, cancellationToken);
-        var exchange = new BridgeExchange(writer);
+        var exchange = new BridgeExchange(writer, cancellationToken);
         var disposeState = false;
         var gateHeld = false;
 
@@ -95,7 +105,7 @@ internal sealed class CopilotToolBridgeInferenceBridge(
 
             if (!state.WaitingForToolOutput)
             {
-                writer.TryWrite(new FinalTextOutput(state.FinalText));
+                await writer.WriteAsync(new FinalTextOutput(state.FinalText), cancellationToken);
                 disposeState = true;
             }
         }
@@ -111,6 +121,8 @@ internal sealed class CopilotToolBridgeInferenceBridge(
                 state.CloseExchange(exchange);
                 state.Gate.Release();
             }
+
+            exchange.Dispose();
 
             if (disposeState)
             {
@@ -120,18 +132,23 @@ internal sealed class CopilotToolBridgeInferenceBridge(
         }
     }
 
-    private async Task ContinuePendingToolCallAsync(
-        PendingToolOutput pendingToolOutput,
+    private async Task ContinuePendingToolCallsAsync(
+        IReadOnlyList<PendingToolOutput> pendingToolOutputs,
         ChannelWriter<BridgeOutput> writer,
         CancellationToken cancellationToken)
     {
-        var pending = pendingToolOutput.PendingCall;
+        var pending = pendingToolOutputs[0].PendingCall;
         if (pending.Session is not CopilotBridgeState state)
         {
             throw new InvalidOperationException($"Pending Copilot tool call {pending.CallId} is not attached to a bridge session.");
         }
 
-        var exchange = new BridgeExchange(writer);
+        if (pendingToolOutputs.Any(output => !ReferenceEquals(output.PendingCall.Session, state)))
+        {
+            throw new InvalidOperationException("Matched Codex tool outputs belong to multiple Copilot bridge sessions.");
+        }
+
+        var exchange = new BridgeExchange(writer, cancellationToken);
         var disposeState = false;
         var gateHeld = false;
 
@@ -140,25 +157,30 @@ internal sealed class CopilotToolBridgeInferenceBridge(
             await state.Gate.WaitAsync(cancellationToken);
             gateHeld = true;
 
-            state.MarkToolOutputSubmitted(pending);
             state.OpenExchange(exchange);
 
-            logger.LogInformation(
-                "Returning Codex tool output to Copilot. CallId={CallId} Tool={ToolName}",
-                pending.CallId,
-                pending.Tool.CopilotName);
+            foreach (var pendingToolOutput in pendingToolOutputs)
+            {
+                pending = pendingToolOutput.PendingCall;
+                logger.LogInformation(
+                    "Returning Codex tool output to Copilot. CallId={CallId} Tool={ToolName}",
+                    pending.CallId,
+                    pending.Tool.CopilotName);
 
-            await state.Session.Rpc.Tools.HandlePendingToolCallAsync(
-                pending.CopilotRequestId,
-                pendingToolOutput.Output,
-                error: null!,
-                cancellationToken);
+                await state.Session.Rpc.Tools.HandlePendingToolCallAsync(
+                    pending.CopilotRequestId,
+                    pendingToolOutput.Output,
+                    error: null!,
+                    cancellationToken);
+
+                state.MarkToolOutputSubmitted(pending);
+            }
 
             await exchange.Done.Task.WaitAsync(cancellationToken);
 
             if (!state.WaitingForToolOutput)
             {
-                writer.TryWrite(new FinalTextOutput(state.FinalText));
+                await writer.WriteAsync(new FinalTextOutput(state.FinalText), cancellationToken);
                 disposeState = true;
             }
         }
@@ -174,6 +196,8 @@ internal sealed class CopilotToolBridgeInferenceBridge(
                 state.CloseExchange(exchange);
                 state.Gate.Release();
             }
+
+            exchange.Dispose();
 
             if (disposeState)
             {
@@ -189,15 +213,7 @@ internal sealed class CopilotToolBridgeInferenceBridge(
         CancellationToken cancellationToken)
     {
         var model = string.IsNullOrWhiteSpace(request.Model) ? options.Value.DefaultModel : request.Model;
-        var clientOptions = new CopilotClientOptions
-        {
-            BaseDirectory = ResolveCopilotHome(),
-            UseLoggedInUser = true,
-            Logger = logger
-        };
-
-        var client = new CopilotClient(clientOptions);
-        await client.StartAsync(cancellationToken);
+        var client = await GetCopilotClientAsync(cancellationToken);
 
         var config = new SessionConfig
         {
@@ -215,11 +231,53 @@ internal sealed class CopilotToolBridgeInferenceBridge(
         }
 
         var session = await client.CreateSessionAsync(config, cancellationToken);
-        var state = new CopilotBridgeState(client, session, tools, model);
+        var state = new CopilotBridgeState(session, tools, model);
         session.On<SessionEvent>(evt => HandleSessionEvent(state, evt));
 
         logger.LogInformation("Started Copilot bridge session with {ToolCount} Codex tool declaration(s).", tools.Count);
         return state;
+    }
+
+    private async Task<CopilotClient> GetCopilotClientAsync(CancellationToken cancellationToken)
+    {
+        if (_client is not null)
+        {
+            return _client;
+        }
+
+        await _clientGate.WaitAsync(cancellationToken);
+        try
+        {
+            if (_client is not null)
+            {
+                return _client;
+            }
+
+            var clientOptions = new CopilotClientOptions
+            {
+                BaseDirectory = ResolveCopilotHome(),
+                UseLoggedInUser = true,
+                Logger = logger
+            };
+
+            var client = new CopilotClient(clientOptions);
+            try
+            {
+                await client.StartAsync(cancellationToken);
+            }
+            catch
+            {
+                await client.DisposeAsync();
+                throw;
+            }
+
+            _client = client;
+            return client;
+        }
+        finally
+        {
+            _clientGate.Release();
+        }
     }
 
     private void HandleSessionEvent(CopilotBridgeState state, SessionEvent evt)
@@ -233,7 +291,7 @@ internal sealed class CopilotToolBridgeInferenceBridge(
                 var deltaContent = delta.Data.DeltaContent;
                 if (!string.IsNullOrEmpty(deltaContent))
                 {
-                    state.CurrentExchange?.Writer.TryWrite(new TextDeltaOutput(deltaContent));
+                    state.CurrentExchange?.Write(new TextDeltaOutput(deltaContent));
                 }
                 break;
             case AssistantMessageEvent message:
@@ -243,7 +301,7 @@ internal sealed class CopilotToolBridgeInferenceBridge(
                 state.CurrentExchange?.Done.TrySetException(new InvalidOperationException(error.Data.Message));
                 break;
             case SessionIdleEvent:
-                state.CurrentExchange?.Done.TrySetResult();
+                state.CurrentExchange?.Complete();
                 break;
         }
     }
@@ -290,12 +348,12 @@ internal sealed class CopilotToolBridgeInferenceBridge(
             callId,
             tool.CopilotName);
 
-        exchange.Writer.TryWrite(new FunctionCallRequestOutput(
+        exchange.Write(new FunctionCallRequestOutput(
             callId,
             tool.CodexName,
             RenderArguments(request),
             tool.CodexNamespace));
-        exchange.Done.TrySetResult();
+        exchange.CompleteAfterQuietPeriod(Positive(options.Value.ToolRequestBatchQuietPeriod, DefaultToolRequestBatchQuietPeriod));
     }
 
     private static AIFunctionDeclaration CreateCopilotToolDeclaration(CodexToolDeclaration tool) =>
@@ -354,24 +412,103 @@ internal sealed class CopilotToolBridgeInferenceBridge(
             : Path.Combine(home, ".codex-copilot-bridge", "copilot-home");
     }
 
-    private sealed class BridgeExchange(ChannelWriter<BridgeOutput> writer)
+    private sealed class BridgeExchange(ChannelWriter<BridgeOutput> writer, CancellationToken cancellationToken) : IDisposable
     {
-        public ChannelWriter<BridgeOutput> Writer { get; } = writer;
+        private readonly object _sync = new();
+        private CancellationTokenSource? _quietPeriod;
 
         public TaskCompletionSource Done { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public void Write(BridgeOutput output)
+        {
+            try
+            {
+                writer.WriteAsync(output, cancellationToken).AsTask().GetAwaiter().GetResult();
+            }
+            catch (Exception ex)
+            {
+                Done.TrySetException(ex);
+            }
+        }
+
+        public void Complete()
+        {
+            Done.TrySetResult();
+            CancelQuietPeriod();
+        }
+
+        public void CompleteAfterQuietPeriod(TimeSpan quietPeriod)
+        {
+            CancellationTokenSource quietPeriodToken;
+            CancellationTokenSource? previous;
+
+            lock (_sync)
+            {
+                if (Done.Task.IsCompleted)
+                {
+                    return;
+                }
+
+                previous = _quietPeriod;
+                quietPeriodToken = new CancellationTokenSource();
+                _quietPeriod = quietPeriodToken;
+            }
+
+            previous?.Cancel();
+
+            _ = CompleteAfterQuietPeriodAsync(quietPeriod, quietPeriodToken);
+        }
+
+        public void Dispose()
+        {
+            CancelQuietPeriod();
+        }
+
+        private async Task CompleteAfterQuietPeriodAsync(TimeSpan quietPeriod, CancellationTokenSource quietPeriodToken)
+        {
+            try
+            {
+                await Task.Delay(quietPeriod, quietPeriodToken.Token);
+                Done.TrySetResult();
+            }
+            catch (OperationCanceledException) when (quietPeriodToken.IsCancellationRequested)
+            {
+            }
+            finally
+            {
+                lock (_sync)
+                {
+                    if (ReferenceEquals(_quietPeriod, quietPeriodToken))
+                    {
+                        _quietPeriod = null;
+                    }
+                }
+
+                quietPeriodToken.Dispose();
+            }
+        }
+
+        private void CancelQuietPeriod()
+        {
+            CancellationTokenSource? quietPeriod;
+            lock (_sync)
+            {
+                quietPeriod = _quietPeriod;
+                _quietPeriod = null;
+            }
+
+            quietPeriod?.Cancel();
+        }
     }
 
     private sealed class CopilotBridgeState(
-        CopilotClient client,
         CopilotSession session,
         IReadOnlyList<CodexToolDeclaration> tools,
         string model) : IPendingBridgeSession
     {
         private readonly object _sync = new();
         private bool _disposed;
-        private PendingToolCall? _pendingToolCall;
-
-        public CopilotClient Client { get; } = client;
+        private readonly HashSet<string> _pendingToolCallIds = new(StringComparer.Ordinal);
 
         public CopilotSession Session { get; } = session;
 
@@ -392,7 +529,7 @@ internal sealed class CopilotToolBridgeInferenceBridge(
             {
                 lock (_sync)
                 {
-                    return _pendingToolCall is not null;
+                    return _pendingToolCallIds.Count > 0;
                 }
             }
         }
@@ -420,7 +557,7 @@ internal sealed class CopilotToolBridgeInferenceBridge(
         {
             lock (_sync)
             {
-                _pendingToolCall = pendingToolCall;
+                _pendingToolCallIds.Add(pendingToolCall.CallId);
             }
         }
 
@@ -428,10 +565,7 @@ internal sealed class CopilotToolBridgeInferenceBridge(
         {
             lock (_sync)
             {
-                if (ReferenceEquals(_pendingToolCall, pendingToolCall))
-                {
-                    _pendingToolCall = null;
-                }
+                _pendingToolCallIds.Remove(pendingToolCall.CallId);
             }
         }
 
@@ -448,7 +582,6 @@ internal sealed class CopilotToolBridgeInferenceBridge(
             }
 
             await Session.DisposeAsync();
-            await Client.DisposeAsync();
             Gate.Dispose();
         }
     }

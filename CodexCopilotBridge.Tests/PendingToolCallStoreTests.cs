@@ -8,7 +8,7 @@ namespace CodexCopilotBridge.Tests;
 public sealed class PendingToolCallStoreTests
 {
     [Fact]
-    public void TryTakeOutput_ReturnsAndRemovesMatchingPendingCall()
+    public void TryTakeOutputs_ReturnsAndRemovesMatchingPendingCall()
     {
         var store = CreateStore();
         var session = new FakeSession();
@@ -29,12 +29,90 @@ public sealed class PendingToolCallStoreTests
             """,
             ProtocolJson.SerializerOptions);
 
-        var found = store.TryTakeOutput(request!, out var output);
+        var found = store.TryTakeOutputs(request!, out var outputs);
 
         Assert.True(found);
+        var output = Assert.Single(outputs);
         Assert.Same(pending, output.PendingCall);
         Assert.Equal("tool output", output.Output);
         Assert.Equal(0, store.Snapshot().PendingToolCallCount);
+    }
+
+    [Fact]
+    public void TryTakeOutputs_ReturnsAllMatchingPendingCallsForOneSession()
+    {
+        var store = CreateStore();
+        var firstSession = new FakeSession();
+        var secondSession = new FakeSession();
+        var firstPending = CreatePendingToolCall("call_1", firstSession);
+        var secondPending = CreatePendingToolCall("call_2", firstSession);
+        var otherSessionPending = CreatePendingToolCall("call_3", secondSession);
+        Assert.True(store.TryAdd(firstPending));
+        Assert.True(store.TryAdd(secondPending));
+        Assert.True(store.TryAdd(otherSessionPending));
+        var request = JsonSerializer.Deserialize<ResponsesApiRequest>(
+            """
+            {
+              "model": "gpt-5.5",
+              "input": [
+                {
+                  "type": "function_call_output",
+                  "call_id": "call_1",
+                  "output": "first output"
+                },
+                {
+                  "type": "function_call_output",
+                  "call_id": "call_2",
+                  "output": "second output"
+                },
+                {
+                  "type": "function_call_output",
+                  "call_id": "call_3",
+                  "output": "other session output"
+                }
+              ]
+            }
+            """,
+            ProtocolJson.SerializerOptions);
+
+        var found = store.TryTakeOutputs(request!, out var outputs);
+
+        Assert.True(found);
+        Assert.Equal(2, outputs.Count);
+        Assert.Contains(outputs, output => ReferenceEquals(output.PendingCall, firstPending) && output.Output == "first output");
+        Assert.Contains(outputs, output => ReferenceEquals(output.PendingCall, secondPending) && output.Output == "second output");
+        Assert.Equal(1, store.Snapshot().PendingToolCallCount);
+    }
+
+    [Fact]
+    public void TryTakeOutputs_IgnoresHistoricalOutputsWhenNoPendingCallMatches()
+    {
+        var store = CreateStore();
+        var request = JsonSerializer.Deserialize<ResponsesApiRequest>(
+            """
+            {
+              "model": "gpt-5.5",
+              "input": [
+                {
+                  "type": "function_call",
+                  "call_id": "call_1",
+                  "name": "shell_command",
+                  "arguments": "{\"command\":\"pwd\"}"
+                },
+                {
+                  "type": "function_call_output",
+                  "call_id": "call_1",
+                  "output": "historical output"
+                }
+              ]
+            }
+            """,
+            ProtocolJson.SerializerOptions);
+
+        var found = store.TryTakeOutputs(request!, out var outputs);
+
+        Assert.False(found);
+        Assert.Empty(outputs);
     }
 
     [Fact]

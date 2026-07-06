@@ -59,7 +59,7 @@ base_url = "http://127.0.0.1:17776/v1"
 wire_api = "responses"
 requires_openai_auth = false
 supports_websockets = false
-stream_idle_timeout_ms = 600000
+stream_idle_timeout_ms = 3600000
 
 model_provider = "github-copilot-bridge"
 model = "claude-sonnet-4.5"

@@ -11,7 +11,7 @@ public sealed class CopilotSdkInferenceBridge(IOptions<BridgeOptions> options, I
         ResponsesApiRequest request,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        var channel = Channel.CreateUnbounded<BridgeOutput>();
+        var channel = BridgeOutputChannels.CreateBounded(options.Value.ResponseOutputChannelCapacity);
         var prompt = CodexPromptRenderer.Render(request);
         var model = string.IsNullOrWhiteSpace(request.Model) ? options.Value.DefaultModel : request.Model;
 
@@ -40,6 +40,18 @@ public sealed class CopilotSdkInferenceBridge(IOptions<BridgeOptions> options, I
                 var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
                 var finalText = string.Empty;
 
+                void WriteOutput(BridgeOutput output)
+                {
+                    try
+                    {
+                        channel.Writer.WriteAsync(output, cancellationToken).AsTask().GetAwaiter().GetResult();
+                    }
+                    catch (Exception ex)
+                    {
+                        done.TrySetException(ex);
+                    }
+                }
+
                 session.On<SessionEvent>(evt =>
                 {
                     switch (evt)
@@ -48,7 +60,7 @@ public sealed class CopilotSdkInferenceBridge(IOptions<BridgeOptions> options, I
                             var deltaContent = delta.Data.DeltaContent;
                             if (!string.IsNullOrEmpty(deltaContent))
                             {
-                                channel.Writer.TryWrite(new TextDeltaOutput(deltaContent));
+                                WriteOutput(new TextDeltaOutput(deltaContent));
                             }
                             break;
                         case AssistantMessageEvent message:
@@ -65,14 +77,14 @@ public sealed class CopilotSdkInferenceBridge(IOptions<BridgeOptions> options, I
 
                 await session.SendAsync(new MessageOptions { Prompt = prompt }, cancellationToken);
                 await done.Task.WaitAsync(cancellationToken);
-                channel.Writer.TryWrite(new FinalTextOutput(finalText));
+                await channel.Writer.WriteAsync(new FinalTextOutput(finalText), cancellationToken);
                 channel.Writer.TryComplete();
             }
             catch (Exception ex)
             {
                 channel.Writer.TryComplete(ex);
             }
-        }, cancellationToken);
+        }, CancellationToken.None);
 
         await foreach (var output in channel.Reader.ReadAllAsync(cancellationToken))
         {

@@ -18,7 +18,7 @@ public sealed class CopilotToolProbeInferenceBridge(
         ResponsesApiRequest request,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        var channel = Channel.CreateUnbounded<BridgeOutput>();
+        var channel = BridgeOutputChannels.CreateBounded(options.Value.ResponseOutputChannelCapacity);
         var model = string.IsNullOrWhiteSpace(request.Model) ? options.Value.DefaultModel : request.Model;
 
         _ = Task.Run(async () =>
@@ -52,6 +52,18 @@ public sealed class CopilotToolProbeInferenceBridge(
                 var finalText = string.Empty;
                 var requestedExternalTool = false;
 
+                void WriteOutput(BridgeOutput output)
+                {
+                    try
+                    {
+                        channel.Writer.WriteAsync(output, cancellationToken).AsTask().GetAwaiter().GetResult();
+                    }
+                    catch (Exception ex)
+                    {
+                        done.TrySetException(ex);
+                    }
+                }
+
                 session.On<SessionEvent>(evt =>
                 {
                     switch (evt)
@@ -69,7 +81,7 @@ public sealed class CopilotToolProbeInferenceBridge(
                             var deltaContent = delta.Data.DeltaContent;
                             if (!string.IsNullOrEmpty(deltaContent))
                             {
-                                channel.Writer.TryWrite(new TextDeltaOutput(deltaContent));
+                                WriteOutput(new TextDeltaOutput(deltaContent));
                             }
                             break;
                         case AssistantMessageEvent message:
@@ -98,14 +110,14 @@ public sealed class CopilotToolProbeInferenceBridge(
                     throw new InvalidOperationException($"Copilot did not request the {BridgeEchoToolName} external tool.");
                 }
 
-                channel.Writer.TryWrite(new FinalTextOutput(finalText));
+                await channel.Writer.WriteAsync(new FinalTextOutput(finalText), cancellationToken);
                 channel.Writer.TryComplete();
             }
             catch (Exception ex)
             {
                 channel.Writer.TryComplete(ex);
             }
-        }, cancellationToken);
+        }, CancellationToken.None);
 
         await foreach (var output in channel.Reader.ReadAllAsync(cancellationToken))
         {

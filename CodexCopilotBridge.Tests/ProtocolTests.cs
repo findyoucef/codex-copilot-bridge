@@ -1,5 +1,7 @@
 using System.Text.Json;
+using CodexCopilotBridge.Inference;
 using CodexCopilotBridge.Protocol;
+using Microsoft.AspNetCore.Http;
 
 namespace CodexCopilotBridge.Tests;
 
@@ -39,6 +41,38 @@ public sealed class ProtocolTests
     }
 
     [Fact]
+    public void OutputTextDelta_IncludesStreamingIndexes()
+    {
+        var json = JsonSerializer.Serialize(
+            ResponsesEvents.OutputTextDelta("resp_123", "hello"),
+            ProtocolJson.SerializerOptions);
+
+        using var document = JsonDocument.Parse(json);
+        var root = document.RootElement;
+
+        Assert.Equal("response.output_text.delta", root.GetProperty("type").GetString());
+        Assert.Equal("msg_resp_123", root.GetProperty("item_id").GetString());
+        Assert.Equal(0, root.GetProperty("output_index").GetInt32());
+        Assert.Equal(0, root.GetProperty("content_index").GetInt32());
+        Assert.Equal("hello", root.GetProperty("delta").GetString());
+    }
+
+    [Fact]
+    public void OutputTextDone_UsesResponsesTextDoneShape()
+    {
+        var json = JsonSerializer.Serialize(
+            ResponsesEvents.OutputTextDone("resp_123", "hello"),
+            ProtocolJson.SerializerOptions);
+
+        using var document = JsonDocument.Parse(json);
+        var root = document.RootElement;
+
+        Assert.Equal("response.output_text.done", root.GetProperty("type").GetString());
+        Assert.Equal("msg_resp_123", root.GetProperty("item_id").GetString());
+        Assert.Equal("hello", root.GetProperty("text").GetString());
+    }
+
+    [Fact]
     public void FunctionCallDone_UsesCodexFunctionCallShape()
     {
         var json = JsonSerializer.Serialize(
@@ -53,6 +87,31 @@ public sealed class ProtocolTests
         Assert.Equal("call_1", root.GetProperty("item").GetProperty("call_id").GetString());
         Assert.Equal("shell_command", root.GetProperty("item").GetProperty("name").GetString());
         Assert.Equal("{\"command\":\"pwd\"}", root.GetProperty("item").GetProperty("arguments").GetString());
+    }
+
+    [Fact]
+    public async Task JsonResponseWriter_AggregatesDeltasForNonStreamingResponse()
+    {
+        var context = new DefaultHttpContext();
+        await using var body = new MemoryStream();
+        context.Response.Body = body;
+        var request = new ResponsesApiRequest { Model = "gpt-5.5", Stream = false };
+        var bridge = new FakeBridge(
+            new TextDeltaOutput("hel"),
+            new TextDeltaOutput("lo"),
+            new FinalTextOutput("hello"));
+
+        await JsonResponseWriter.WriteResponseAsync(context, request, bridge, CancellationToken.None);
+
+        body.Position = 0;
+        using var document = await JsonDocument.ParseAsync(body);
+        var root = document.RootElement;
+
+        Assert.Equal(StatusCodes.Status200OK, context.Response.StatusCode);
+        Assert.Equal("completed", root.GetProperty("status").GetString());
+        Assert.True(root.GetProperty("end_turn").GetBoolean());
+        Assert.Equal("message", root.GetProperty("output")[0].GetProperty("type").GetString());
+        Assert.Equal("hello", root.GetProperty("output")[0].GetProperty("content")[0].GetProperty("text").GetString());
     }
 
     [Fact]
@@ -253,5 +312,19 @@ public sealed class ProtocolTests
         Assert.Equal("mcp__demo__", tool.CodexNamespace);
         Assert.Contains("Demo tools.", tool.Description);
         Assert.Contains("Look up an order.", tool.Description);
+    }
+
+    private sealed class FakeBridge(params BridgeOutput[] outputs) : IInferenceBridge
+    {
+        public async IAsyncEnumerable<BridgeOutput> CreateResponseAsync(
+            ResponsesApiRequest request,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            foreach (var output in outputs)
+            {
+                await Task.Yield();
+                yield return output;
+            }
+        }
     }
 }
