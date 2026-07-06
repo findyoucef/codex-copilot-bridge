@@ -2,6 +2,55 @@
 
 Local bridge for experimenting with GitHub Copilot as a Codex CLI inference provider.
 
+## Architecture
+
+The bridge is a loopback ASP.NET Core service that speaks Codex's OpenAI Responses-compatible provider protocol on one side and the GitHub Copilot SDK protocol on the other. Codex still owns local tool execution, sandboxing, approvals, and workspace writes; the bridge only translates model text, tool declarations, tool-call requests, and tool outputs between the two protocols.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant User
+    participant Codex as Codex CLI
+    participant Bridge as codex-copilot-bridge<br/>127.0.0.1:17776
+    participant Store as PendingToolCallStore
+    participant Copilot as Shared CopilotClient
+    participant Session as CopilotSession
+    participant Tools as Local Codex tools
+
+    User->>Codex: Prompt or task
+    Codex->>Bridge: POST /v1/responses<br/>messages + tool declarations
+    Bridge->>Copilot: Reuse/start CopilotClient
+    Bridge->>Session: Create CopilotSession for this fresh request<br/>with declaration-only tools
+    Session-->>Bridge: AssistantMessageDelta events
+    Bridge-->>Codex: SSE response.output_text.delta
+    Codex-->>User: Streams assistant text
+
+    alt Copilot needs a tool
+        Session-->>Bridge: external_tool.requested
+        Bridge->>Store: Save request id, call id, session, tool metadata
+        Bridge-->>Codex: SSE function_call item
+        Codex->>Tools: Execute tool under Codex sandbox/approval rules
+        Tools-->>Codex: Tool output
+        Codex->>Bridge: POST /v1/responses<br/>full history + function_call_output
+        Bridge->>Store: Match pending call id and take output
+        Bridge->>Session: HandlePendingToolCallAsync(output)
+        Session-->>Bridge: More text, more tools, or idle
+        Bridge-->>Codex: SSE deltas or more function_call items
+    end
+
+    Session-->>Bridge: SessionIdleEvent / final assistant message
+    Bridge-->>Codex: response.output_text.done<br/>response.completed
+    Codex-->>User: Final answer
+```
+
+Key lifecycle details:
+
+- The Copilot client is shared and reused so each request does not restart the Copilot runtime.
+- Fresh Codex requests create fresh Copilot sessions because Codex sends full conversation history; pending tool-output follow-ups resume the existing session attached to the pending call.
+- Pending tool calls are kept in memory with a TTL so long-running Codex tool executions can return later.
+- Text deltas are streamed immediately over Server-Sent Events; final completion events are emitted once the Copilot turn is idle or waiting on Codex tool output.
+- Copilot tools are declaration-only in bridge mode. Codex remains the only process that executes shell, filesystem, MCP, and other local tools.
+
 ## Quick Setup on macOS
 
 Prerequisites:
