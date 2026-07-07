@@ -20,6 +20,8 @@ public static class SseResponseWriter
         var contentPartStarted = false;
         var emittedText = false;
         var emittedToolCall = false;
+        var nextOutputIndex = 0;
+        int? textOutputIndex = null;
 
         context.Response.StatusCode = StatusCodes.Status200OK;
         context.Response.ContentType = "text/event-stream";
@@ -36,21 +38,15 @@ public static class SseResponseWriter
                 switch (output)
                 {
                     case TextDeltaOutput delta when !string.IsNullOrEmpty(delta.Delta):
-                        if (!textItemStarted)
-                        {
-                            await WriteEventAsync(context, "response.output_item.added", ResponsesEvents.OutputMessageAdded(responseId), cancellationToken);
-                            textItemStarted = true;
-                        }
-
-                        if (!contentPartStarted)
-                        {
-                            await WriteEventAsync(context, "response.content_part.added", ResponsesEvents.ContentPartAdded(responseId), cancellationToken);
-                            contentPartStarted = true;
-                        }
+                        var deltaOutputIndex = await EnsureTextItemStartedAsync();
 
                         text.Append(delta.Delta);
                         emittedText = true;
-                        await WriteEventAsync(context, "response.output_text.delta", ResponsesEvents.OutputTextDelta(responseId, delta.Delta), cancellationToken);
+                        await WriteEventAsync(
+                            context,
+                            "response.output_text.delta",
+                            ResponsesEvents.OutputTextDelta(responseId, delta.Delta, deltaOutputIndex),
+                            cancellationToken);
                         break;
                     case FinalTextOutput final:
                         if (!string.IsNullOrEmpty(final.Text) || text.Length == 0)
@@ -62,6 +58,7 @@ public static class SseResponseWriter
                         break;
                     case FunctionCallRequestOutput functionCall:
                         emittedToolCall = true;
+                        var functionCallOutputIndex = nextOutputIndex++;
                         await WriteEventAsync(
                             context,
                             "response.output_item.done",
@@ -69,7 +66,8 @@ public static class SseResponseWriter
                                 functionCall.CallId,
                                 functionCall.Name,
                                 functionCall.Arguments,
-                                functionCall.Namespace),
+                                functionCall.Namespace,
+                                functionCallOutputIndex),
                             cancellationToken);
                         break;
                 }
@@ -78,21 +76,11 @@ public static class SseResponseWriter
             if (emittedText)
             {
                 var completedText = finalText ?? text.ToString();
+                var completedTextOutputIndex = await EnsureTextItemStartedAsync();
 
-                if (!textItemStarted)
-                {
-                    await WriteEventAsync(context, "response.output_item.added", ResponsesEvents.OutputMessageAdded(responseId), cancellationToken);
-                    textItemStarted = true;
-                }
-
-                if (!contentPartStarted)
-                {
-                    await WriteEventAsync(context, "response.content_part.added", ResponsesEvents.ContentPartAdded(responseId), cancellationToken);
-                }
-
-                await WriteEventAsync(context, "response.output_text.done", ResponsesEvents.OutputTextDone(responseId, completedText), cancellationToken);
-                await WriteEventAsync(context, "response.content_part.done", ResponsesEvents.ContentPartDone(responseId, completedText), cancellationToken);
-                await WriteEventAsync(context, "response.output_item.done", ResponsesEvents.OutputMessageDone(responseId, completedText), cancellationToken);
+                await WriteEventAsync(context, "response.output_text.done", ResponsesEvents.OutputTextDone(responseId, completedText, completedTextOutputIndex), cancellationToken);
+                await WriteEventAsync(context, "response.content_part.done", ResponsesEvents.ContentPartDone(responseId, completedText, completedTextOutputIndex), cancellationToken);
+                await WriteEventAsync(context, "response.output_item.done", ResponsesEvents.OutputMessageDone(responseId, completedText, completedTextOutputIndex), cancellationToken);
             }
 
             await WriteEventAsync(context, "response.completed", ResponsesEvents.Completed(responseId, endTurn: !emittedToolCall), cancellationToken);
@@ -104,6 +92,26 @@ public static class SseResponseWriter
         catch (Exception ex)
         {
             await WriteEventAsync(context, "response.failed", ResponsesEvents.Failed(responseId, ex.Message), CancellationToken.None);
+        }
+
+        async Task<int> EnsureTextItemStartedAsync()
+        {
+            textOutputIndex ??= nextOutputIndex++;
+            var outputIndex = textOutputIndex.Value;
+
+            if (!textItemStarted)
+            {
+                await WriteEventAsync(context, "response.output_item.added", ResponsesEvents.OutputMessageAdded(responseId, outputIndex), cancellationToken);
+                textItemStarted = true;
+            }
+
+            if (!contentPartStarted)
+            {
+                await WriteEventAsync(context, "response.content_part.added", ResponsesEvents.ContentPartAdded(responseId, outputIndex), cancellationToken);
+                contentPartStarted = true;
+            }
+
+            return outputIndex;
         }
     }
 

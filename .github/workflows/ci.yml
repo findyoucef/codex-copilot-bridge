@@ -27,6 +27,9 @@ jobs:
       - name: Restore
         run: dotnet restore CodexCopilotBridge.slnx
 
+      - name: Format
+        run: dotnet format CodexCopilotBridge.slnx --verify-no-changes --no-restore --verbosity minimal
+
       - name: Test
         run: dotnet test CodexCopilotBridge.slnx --configuration Release --no-restore
 

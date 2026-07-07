@@ -1,4 +1,3 @@
-using System.Threading.Channels;
 using CodexCopilotBridge.Protocol;
 using GitHub.Copilot;
 using Microsoft.Extensions.Options;
@@ -11,82 +10,71 @@ public sealed class CopilotSdkInferenceBridge(IOptions<BridgeOptions> options, I
         ResponsesApiRequest request,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        var channel = BridgeOutputChannels.CreateBounded(options.Value.ResponseOutputChannelCapacity);
         var prompt = CodexPromptRenderer.Render(request);
         var model = string.IsNullOrWhiteSpace(request.Model) ? options.Value.DefaultModel : request.Model;
 
-        _ = Task.Run(async () =>
+        await foreach (var output in BridgeResponseRunner.RunAsync(options.Value, async (writer, operationToken) =>
         {
-            try
+            var clientOptions = new CopilotClientOptions
             {
-                var clientOptions = new CopilotClientOptions
+                BaseDirectory = ResolveCopilotHome(),
+                UseLoggedInUser = true,
+                Logger = logger
+            };
+
+            await using var client = new CopilotClient(clientOptions);
+            await client.StartAsync(operationToken);
+
+            await using var session = await client.CreateSessionAsync(
+                new SessionConfig
                 {
-                    BaseDirectory = ResolveCopilotHome(),
-                    UseLoggedInUser = true,
-                    Logger = logger
-                };
+                    Model = model,
+                    Streaming = true
+                },
+                operationToken);
 
-                await using var client = new CopilotClient(clientOptions);
-                await client.StartAsync(cancellationToken);
+            var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var finalText = string.Empty;
 
-                await using var session = await client.CreateSessionAsync(
-                    new SessionConfig
-                    {
-                        Model = model,
-                        Streaming = true
-                    },
-                    cancellationToken);
-
-                var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-                var finalText = string.Empty;
-
-                void WriteOutput(BridgeOutput output)
+            void WriteOutput(BridgeOutput bridgeOutput)
+            {
+                try
                 {
-                    try
-                    {
-                        channel.Writer.WriteAsync(output, cancellationToken).AsTask().GetAwaiter().GetResult();
-                    }
-                    catch (Exception ex)
-                    {
-                        done.TrySetException(ex);
-                    }
+                    writer.WriteAsync(bridgeOutput, operationToken).AsTask().GetAwaiter().GetResult();
                 }
-
-                session.On<SessionEvent>(evt =>
+                catch (Exception ex)
                 {
-                    switch (evt)
-                    {
-                        case AssistantMessageDeltaEvent delta:
-                            var deltaContent = delta.Data.DeltaContent;
-                            if (!string.IsNullOrEmpty(deltaContent))
-                            {
-                                WriteOutput(new TextDeltaOutput(deltaContent));
-                            }
-                            break;
-                        case AssistantMessageEvent message:
-                            finalText = message.Data.Content ?? string.Empty;
-                            break;
-                        case SessionErrorEvent error:
-                            done.TrySetException(new InvalidOperationException(error.Data.Message));
-                            break;
-                        case SessionIdleEvent:
-                            done.TrySetResult();
-                            break;
-                    }
-                });
-
-                await session.SendAsync(new MessageOptions { Prompt = prompt }, cancellationToken);
-                await done.Task.WaitAsync(cancellationToken);
-                await channel.Writer.WriteAsync(new FinalTextOutput(finalText), cancellationToken);
-                channel.Writer.TryComplete();
+                    done.TrySetException(ex);
+                }
             }
-            catch (Exception ex)
+
+            session.On<SessionEvent>(evt =>
             {
-                channel.Writer.TryComplete(ex);
-            }
-        }, CancellationToken.None);
+                switch (evt)
+                {
+                    case AssistantMessageDeltaEvent delta:
+                        var deltaContent = delta.Data.DeltaContent;
+                        if (!string.IsNullOrEmpty(deltaContent))
+                        {
+                            WriteOutput(new TextDeltaOutput(deltaContent));
+                        }
+                        break;
+                    case AssistantMessageEvent message:
+                        finalText = message.Data.Content ?? string.Empty;
+                        break;
+                    case SessionErrorEvent error:
+                        done.TrySetException(new InvalidOperationException(error.Data.Message));
+                        break;
+                    case SessionIdleEvent:
+                        done.TrySetResult();
+                        break;
+                }
+            });
 
-        await foreach (var output in channel.Reader.ReadAllAsync(cancellationToken))
+            await session.SendAsync(new MessageOptions { Prompt = prompt }, operationToken);
+            await done.Task.WaitAsync(operationToken);
+            await writer.WriteAsync(new FinalTextOutput(finalText), operationToken);
+        }, cancellationToken))
         {
             yield return output;
         }

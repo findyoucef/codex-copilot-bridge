@@ -15,43 +15,23 @@ internal sealed class CopilotToolBridgeInferenceBridge(
     private static readonly TimeSpan DefaultToolRequestBatchQuietPeriod = TimeSpan.FromMilliseconds(500);
     private readonly SemaphoreSlim _clientGate = new(1, 1);
     private CopilotClient? _client;
+    private int _disposed;
 
     public async IAsyncEnumerable<BridgeOutput> CreateResponseAsync(
         ResponsesApiRequest request,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        var channel = BridgeOutputChannels.CreateBounded(options.Value.ResponseOutputChannelCapacity);
-
-        _ = Task.Run(async () =>
+        await foreach (var output in BridgeResponseRunner.RunAsync(options.Value, async (writer, operationToken) =>
         {
-            var requestTimeout = Positive(options.Value.RequestTimeout, TimeSpan.FromHours(1));
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeout.CancelAfter(requestTimeout);
-
-            try
+            if (pendingToolCalls.TryTakeOutputs(request, out var pendingToolOutputs))
             {
-                if (pendingToolCalls.TryTakeOutputs(request, out var pendingToolOutputs))
-                {
-                    await ContinuePendingToolCallsAsync(pendingToolOutputs, channel.Writer, timeout.Token);
-                }
-                else
-                {
-                    await StartCopilotTurnAsync(request, channel.Writer, timeout.Token);
-                }
-
-                channel.Writer.TryComplete();
+                await ContinuePendingToolCallsAsync(pendingToolOutputs, writer, operationToken);
             }
-            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            else
             {
-                channel.Writer.TryComplete(new TimeoutException($"Copilot bridge request timed out after {requestTimeout}."));
+                await StartCopilotTurnAsync(request, writer, operationToken);
             }
-            catch (Exception ex)
-            {
-                channel.Writer.TryComplete(ex);
-            }
-        }, CancellationToken.None);
-
-        await foreach (var output in channel.Reader.ReadAllAsync(cancellationToken))
+        }, cancellationToken))
         {
             yield return output;
         }
@@ -59,6 +39,11 @@ internal sealed class CopilotToolBridgeInferenceBridge(
 
     public async ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+
         await pendingToolCalls.DisposeAsync();
 
         await _clientGate.WaitAsync();

@@ -115,6 +115,34 @@ public sealed class ProtocolTests
     }
 
     [Fact]
+    public async Task SseResponseWriter_UsesDistinctOutputIndexesForMixedTextAndToolCall()
+    {
+        var context = new DefaultHttpContext();
+        await using var body = new MemoryStream();
+        context.Response.Body = body;
+        var request = new ResponsesApiRequest { Model = "gpt-5.5", Stream = true };
+        var bridge = new FakeBridge(
+            new TextDeltaOutput("checking"),
+            new FunctionCallRequestOutput("call_1", "shell_command", "{\"command\":\"pwd\"}"));
+
+        await SseResponseWriter.WriteResponseAsync(context, request, bridge, CancellationToken.None);
+
+        body.Position = 0;
+        using var reader = new StreamReader(body);
+        var events = ReadSseDataEvents(await reader.ReadToEndAsync());
+
+        var textDelta = events.Single(EventType("response.output_text.delta"));
+        var textDone = events.Single(EventType("response.output_text.done"));
+        var functionCall = events.Single(evt =>
+            evt.GetProperty("type").GetString() == "response.output_item.done" &&
+            evt.GetProperty("item").GetProperty("type").GetString() == "function_call");
+
+        Assert.Equal(0, textDelta.GetProperty("output_index").GetInt32());
+        Assert.Equal(0, textDone.GetProperty("output_index").GetInt32());
+        Assert.Equal(1, functionCall.GetProperty("output_index").GetInt32());
+    }
+
+    [Fact]
     public void ModelCatalog_IncludesRequiredCodexFields()
     {
         var json = JsonSerializer.Serialize(
@@ -326,5 +354,25 @@ public sealed class ProtocolTests
                 yield return output;
             }
         }
+    }
+
+    private static Func<JsonElement, bool> EventType(string eventType) =>
+        evt => evt.GetProperty("type").GetString() == eventType;
+
+    private static IReadOnlyList<JsonElement> ReadSseDataEvents(string body)
+    {
+        var events = new List<JsonElement>();
+        foreach (var line in body.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (!line.StartsWith("data: ", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            using var document = JsonDocument.Parse(line["data: ".Length..]);
+            events.Add(document.RootElement.Clone());
+        }
+
+        return events;
     }
 }

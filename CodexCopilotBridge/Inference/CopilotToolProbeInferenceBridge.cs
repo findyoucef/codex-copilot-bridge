@@ -1,5 +1,4 @@
 using System.Text.Json;
-using System.Threading.Channels;
 using CodexCopilotBridge.Protocol;
 using GitHub.Copilot;
 using Microsoft.Extensions.AI;
@@ -18,108 +17,97 @@ public sealed class CopilotToolProbeInferenceBridge(
         ResponsesApiRequest request,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        var channel = BridgeOutputChannels.CreateBounded(options.Value.ResponseOutputChannelCapacity);
         var model = string.IsNullOrWhiteSpace(request.Model) ? options.Value.DefaultModel : request.Model;
 
-        _ = Task.Run(async () =>
+        await foreach (var output in BridgeResponseRunner.RunAsync(options.Value, async (writer, operationToken) =>
         {
-            try
+            var clientOptions = new CopilotClientOptions
             {
-                var clientOptions = new CopilotClientOptions
+                BaseDirectory = ResolveCopilotHome(),
+                UseLoggedInUser = true,
+                Logger = logger
+            };
+
+            await using var client = new CopilotClient(clientOptions);
+            await client.StartAsync(operationToken);
+
+            await using var session = await client.CreateSessionAsync(
+                new SessionConfig
                 {
-                    BaseDirectory = ResolveCopilotHome(),
-                    UseLoggedInUser = true,
-                    Logger = logger
-                };
+                    Model = model,
+                    Streaming = true,
+                    Tools = [CreateBridgeEchoDeclaration()],
+                    AvailableTools = [BridgeEchoToolName],
+                    SkipCustomInstructions = true,
+                    EnableSkills = false,
+                    OnPermissionRequest = PermissionHandler.ApproveAll
+                },
+                operationToken);
 
-                await using var client = new CopilotClient(clientOptions);
-                await client.StartAsync(cancellationToken);
+            var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var finalText = string.Empty;
+            var requestedExternalTool = false;
 
-                await using var session = await client.CreateSessionAsync(
-                    new SessionConfig
-                    {
-                        Model = model,
-                        Streaming = true,
-                        Tools = [CreateBridgeEchoDeclaration()],
-                        AvailableTools = [BridgeEchoToolName],
-                        SkipCustomInstructions = true,
-                        EnableSkills = false,
-                        OnPermissionRequest = PermissionHandler.ApproveAll
-                    },
-                    cancellationToken);
-
-                var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-                var finalText = string.Empty;
-                var requestedExternalTool = false;
-
-                void WriteOutput(BridgeOutput output)
-                {
-                    try
-                    {
-                        channel.Writer.WriteAsync(output, cancellationToken).AsTask().GetAwaiter().GetResult();
-                    }
-                    catch (Exception ex)
-                    {
-                        done.TrySetException(ex);
-                    }
-                }
-
-                session.On<SessionEvent>(evt =>
-                {
-                    switch (evt)
-                    {
-	                        case ExternalToolRequestedEvent externalTool:
-	                            requestedExternalTool = true;
-	                            _ = RespondToExternalToolAsync(session, externalTool.Data, cancellationToken)
-	                                .ContinueWith(
-	                                    task => done.TrySetException(task.Exception!.GetBaseException()),
-	                                    CancellationToken.None,
-	                                    TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
-	                                    TaskScheduler.Default);
-	                            break;
-                        case AssistantMessageDeltaEvent delta:
-                            var deltaContent = delta.Data.DeltaContent;
-                            if (!string.IsNullOrEmpty(deltaContent))
-                            {
-                                WriteOutput(new TextDeltaOutput(deltaContent));
-                            }
-                            break;
-                        case AssistantMessageEvent message:
-                            finalText = message.Data.Content ?? string.Empty;
-                            break;
-                        case SessionErrorEvent error:
-                            done.TrySetException(new InvalidOperationException(error.Data.Message));
-                            break;
-                        case SessionIdleEvent:
-                            done.TrySetResult();
-                            break;
-                    }
-                });
-
-                await session.SendAsync(
-                    new MessageOptions
-                    {
-                        Prompt = $"Call the {BridgeEchoToolName} tool with message \"hello\". Then reply with exactly the tool result and no other text."
-                    },
-                    cancellationToken);
-
-                await done.Task.WaitAsync(cancellationToken);
-
-                if (!requestedExternalTool)
-                {
-                    throw new InvalidOperationException($"Copilot did not request the {BridgeEchoToolName} external tool.");
-                }
-
-                await channel.Writer.WriteAsync(new FinalTextOutput(finalText), cancellationToken);
-                channel.Writer.TryComplete();
-            }
-            catch (Exception ex)
+            void WriteOutput(BridgeOutput bridgeOutput)
             {
-                channel.Writer.TryComplete(ex);
+                try
+                {
+                    writer.WriteAsync(bridgeOutput, operationToken).AsTask().GetAwaiter().GetResult();
+                }
+                catch (Exception ex)
+                {
+                    done.TrySetException(ex);
+                }
             }
-        }, CancellationToken.None);
 
-        await foreach (var output in channel.Reader.ReadAllAsync(cancellationToken))
+            session.On<SessionEvent>(evt =>
+            {
+                switch (evt)
+                {
+                    case ExternalToolRequestedEvent externalTool:
+                        requestedExternalTool = true;
+                        _ = RespondToExternalToolAsync(session, externalTool.Data, operationToken)
+                            .ContinueWith(
+                                task => done.TrySetException(task.Exception!.GetBaseException()),
+                                CancellationToken.None,
+                                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                                TaskScheduler.Default);
+                        break;
+                    case AssistantMessageDeltaEvent delta:
+                        var deltaContent = delta.Data.DeltaContent;
+                        if (!string.IsNullOrEmpty(deltaContent))
+                        {
+                            WriteOutput(new TextDeltaOutput(deltaContent));
+                        }
+                        break;
+                    case AssistantMessageEvent message:
+                        finalText = message.Data.Content ?? string.Empty;
+                        break;
+                    case SessionErrorEvent error:
+                        done.TrySetException(new InvalidOperationException(error.Data.Message));
+                        break;
+                    case SessionIdleEvent:
+                        done.TrySetResult();
+                        break;
+                }
+            });
+
+            await session.SendAsync(
+                new MessageOptions
+                {
+                    Prompt = $"Call the {BridgeEchoToolName} tool with message \"hello\". Then reply with exactly the tool result and no other text."
+                },
+                operationToken);
+
+            await done.Task.WaitAsync(operationToken);
+
+            if (!requestedExternalTool)
+            {
+                throw new InvalidOperationException($"Copilot did not request the {BridgeEchoToolName} external tool.");
+            }
+
+            await writer.WriteAsync(new FinalTextOutput(finalText), operationToken);
+        }, cancellationToken))
         {
             yield return output;
         }
