@@ -18,6 +18,7 @@ public static class SseResponseWriter
         string? finalText = null;
         var textItemStarted = false;
         var contentPartStarted = false;
+        var textItemCompleted = false;
         var emittedText = false;
         var emittedToolCall = false;
         var nextOutputIndex = 0;
@@ -57,6 +58,7 @@ public static class SseResponseWriter
                         emittedText = emittedText || !string.IsNullOrEmpty(final.Text);
                         break;
                     case FunctionCallRequestOutput functionCall:
+                        await CompleteTextItemIfNeededAsync();
                         emittedToolCall = true;
                         var functionCallOutputIndex = nextOutputIndex++;
                         await WriteEventAsync(
@@ -73,15 +75,7 @@ public static class SseResponseWriter
                 }
             }
 
-            if (emittedText)
-            {
-                var completedText = finalText ?? text.ToString();
-                var completedTextOutputIndex = await EnsureTextItemStartedAsync();
-
-                await WriteEventAsync(context, "response.output_text.done", ResponsesEvents.OutputTextDone(responseId, completedText, completedTextOutputIndex), cancellationToken);
-                await WriteEventAsync(context, "response.content_part.done", ResponsesEvents.ContentPartDone(responseId, completedText, completedTextOutputIndex), cancellationToken);
-                await WriteEventAsync(context, "response.output_item.done", ResponsesEvents.OutputMessageDone(responseId, completedText, completedTextOutputIndex), cancellationToken);
-            }
+            await CompleteTextItemIfNeededAsync();
 
             await WriteEventAsync(context, "response.completed", ResponsesEvents.Completed(responseId, endTurn: !emittedToolCall), cancellationToken);
         }
@@ -112,6 +106,22 @@ public static class SseResponseWriter
             }
 
             return outputIndex;
+        }
+
+        async Task CompleteTextItemIfNeededAsync()
+        {
+            if (!emittedText || textItemCompleted)
+            {
+                return;
+            }
+
+            var completedText = finalText ?? text.ToString();
+            var completedTextOutputIndex = await EnsureTextItemStartedAsync();
+
+            await WriteEventAsync(context, "response.output_text.done", ResponsesEvents.OutputTextDone(responseId, completedText, completedTextOutputIndex), cancellationToken);
+            await WriteEventAsync(context, "response.content_part.done", ResponsesEvents.ContentPartDone(responseId, completedText, completedTextOutputIndex), cancellationToken);
+            await WriteEventAsync(context, "response.output_item.done", ResponsesEvents.OutputMessageDone(responseId, completedText, completedTextOutputIndex), cancellationToken);
+            textItemCompleted = true;
         }
     }
 

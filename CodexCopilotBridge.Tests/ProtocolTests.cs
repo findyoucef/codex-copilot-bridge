@@ -133,6 +133,10 @@ public sealed class ProtocolTests
 
         var textDelta = events.Single(EventType("response.output_text.delta"));
         var textDone = events.Single(EventType("response.output_text.done"));
+        var contentPartDone = events.Single(EventType("response.content_part.done"));
+        var messageDone = events.Single(evt =>
+            evt.GetProperty("type").GetString() == "response.output_item.done" &&
+            evt.GetProperty("item").GetProperty("type").GetString() == "message");
         var functionCall = events.Single(evt =>
             evt.GetProperty("type").GetString() == "response.output_item.done" &&
             evt.GetProperty("item").GetProperty("type").GetString() == "function_call");
@@ -140,6 +144,9 @@ public sealed class ProtocolTests
         Assert.Equal(0, textDelta.GetProperty("output_index").GetInt32());
         Assert.Equal(0, textDone.GetProperty("output_index").GetInt32());
         Assert.Equal(1, functionCall.GetProperty("output_index").GetInt32());
+        Assert.True(EventIndex(events, textDone) < EventIndex(events, functionCall));
+        Assert.True(EventIndex(events, contentPartDone) < EventIndex(events, functionCall));
+        Assert.True(EventIndex(events, messageDone) < EventIndex(events, functionCall));
     }
 
     [Fact]
@@ -358,6 +365,19 @@ public sealed class ProtocolTests
 
     private static Func<JsonElement, bool> EventType(string eventType) =>
         evt => evt.GetProperty("type").GetString() == eventType;
+
+    private static int EventIndex(IReadOnlyList<JsonElement> events, JsonElement target)
+    {
+        for (var index = 0; index < events.Count; index++)
+        {
+            if (JsonElement.DeepEquals(events[index], target))
+            {
+                return index;
+            }
+        }
+
+        throw new InvalidOperationException("Could not find target event.");
+    }
 
     private static IReadOnlyList<JsonElement> ReadSseDataEvents(string body)
     {
