@@ -6,6 +6,23 @@ Local bridge for experimenting with GitHub Copilot as a Codex CLI inference prov
 
 The bridge is a loopback ASP.NET Core service that speaks Codex's OpenAI Responses-compatible provider protocol on one side and the GitHub Copilot SDK protocol on the other. Codex still owns local tool execution, sandboxing, approvals, and workspace writes; the bridge only translates model text, tool declarations, tool-call requests, and tool outputs between the two protocols.
 
+At a high level, Codex talks to the bridge as a local Responses API provider, while the bridge keeps the Copilot conversation moving through the GitHub Copilot SDK:
+
+```mermaid
+flowchart LR
+    User([User]) --> Codex[Codex CLI<br/>copilot-bridge profile]
+    Codex <-->|Responses API<br/>localhost SSE| Bridge[codex-copilot-bridge<br/>ASP.NET Core service]
+    Bridge <-->|Copilot SDK session| Runtime[GitHub Copilot SDK/runtime]
+    Runtime <-->|Model traffic| Copilot[GitHub Copilot service]
+
+    Codex --> Tools[Local Codex tools<br/>shell, files, MCP]
+    Tools --> Codex
+    Bridge -.->|Tool call request| Codex
+    Codex -.->|Tool output| Bridge
+```
+
+The detailed request lifecycle is:
+
 ```mermaid
 sequenceDiagram
     autonumber
