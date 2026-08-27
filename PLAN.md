@@ -153,7 +153,7 @@ The implementation is now a runnable tool bridge. It can serve Codex-compatible 
 
 The Codex tool-loop probe is verified: the bridge can emit a `shell_command` function call, Codex executes it, and the bridge receives the resulting `function_call_output`.
 
-The Copilot external-tool probe is verified: the high-level GitHub Copilot SDK can register a declaration-only tool, surface `external_tool.requested`, and accept a result through `HandlePendingToolCallAsync`. This path was verified directly over `/v1/responses` and through `codex exec -m gpt-5.5`. Codex currently warns that it has no built-in metadata for `gpt-5.5`, but the bridge request still completes.
+The Copilot external-tool probe is verified: the high-level GitHub Copilot SDK can register a declaration-only tool, surface `external_tool.requested`, and accept a result through `HandlePendingToolCallAsync`. This path was verified directly over `/v1/responses` and through `codex exec -m gpt-5.5`. Codex requires `model_catalog_json` for custom-provider metadata, so the documented profile saves and loads the bridge's `/v1/models` response instead of using fallback metadata.
 
 The initial full bridge loop is verified: when Copilot requests an external tool, the bridge emits a Codex `function_call` item, persists the pending Copilot request, reads Codex's follow-up `function_call_output`, submits that output back to Copilot, and continues the Copilot session to final text. The live smoke used `codex exec -m gpt-5.5`; Copilot requested Codex's `exec_command` tool, Codex executed `printf "codex-copilot-full-loop-ok"`, and Copilot returned `codex-copilot-full-loop-ok` as the final message.
 

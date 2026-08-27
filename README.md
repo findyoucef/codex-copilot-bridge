@@ -157,10 +157,14 @@ Codex profiles live in `~/.codex/<profile-name>.config.toml`. Create a `copilot-
 ```bash
 mkdir -p "$HOME/.codex"
 
-cat > "$HOME/.codex/copilot-bridge.config.toml" <<'EOF'
-model = "gpt-5.5"
+curl -fsS http://127.0.0.1:17776/v1/models \
+  -o "$HOME/.codex/copilot-bridge-models.json"
+
+cat > "$HOME/.codex/copilot-bridge.config.toml" <<EOF
+model = "gpt-5.6-sol"
 model_provider = "github-copilot-bridge"
 model_reasoning_effort = "medium"
+model_catalog_json = "$HOME/.codex/copilot-bridge-models.json"
 
 [model_providers.github-copilot-bridge]
 name = "GitHub Copilot Bridge"
@@ -171,6 +175,8 @@ supports_websockets = false
 stream_idle_timeout_ms = 3600000
 EOF
 ```
+
+Codex loads custom-provider model metadata from `model_catalog_json`; it does not use the bridge's `/v1/models` response automatically. Refresh the saved catalog after changing `Bridge:DefaultModel`, and keep the profile `model` equal to `Bridge:DefaultModel`.
 
 Use the profile directly:
 
@@ -314,7 +320,7 @@ Set `Bridge:Mode` to `Echo` to test the Codex provider contract without spending
 
 Set `Bridge:Mode` to `CopilotSdk` for text-only Copilot streaming without tool bridging.
 
-The default profile and bridge fallback use `gpt-5.5`. If Copilot rejects that model for your account, set the profile `model` and `Bridge:DefaultModel` to another Copilot-supported model slug.
+The default profile and bridge fallback use `gpt-5.6-sol`. If Copilot rejects that model for your account, set the profile `model` and `Bridge:DefaultModel` to another Copilot-supported model slug, then refresh `~/.codex/copilot-bridge-models.json` from `/v1/models`.
 
 ```bash
 dotnet test

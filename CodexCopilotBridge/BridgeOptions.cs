@@ -4,7 +4,7 @@ public sealed record BridgeOptions
 {
     public BridgeMode Mode { get; init; } = BridgeMode.Echo;
 
-    public string DefaultModel { get; init; } = "gpt-5.5";
+    public string DefaultModel { get; init; } = "gpt-5.6-sol";
 
     public string? CopilotHome { get; init; }
 

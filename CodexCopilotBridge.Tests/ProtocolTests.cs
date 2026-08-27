@@ -168,6 +168,24 @@ public sealed class ProtocolTests
     }
 
     [Fact]
+    public void ModelCatalog_IncludesExtendedGpt56ReasoningLevels()
+    {
+        var json = JsonSerializer.Serialize(
+            CodexModelCatalog.CreateDefault("gpt-5.6-sol"),
+            ProtocolJson.SerializerOptions);
+
+        using var document = JsonDocument.Parse(json);
+        var reasoningLevels = document.RootElement
+            .GetProperty("models")[0]
+            .GetProperty("supported_reasoning_levels")
+            .EnumerateArray()
+            .Select(level => level.GetProperty("effort").GetString()!)
+            .ToArray();
+
+        Assert.Equal(["low", "medium", "high", "xhigh", "max", "ultra"], reasoningLevels);
+    }
+
+    [Fact]
     public void PromptRenderer_FlattensMessagesAndToolOutputs()
     {
         var request = JsonSerializer.Deserialize<ResponsesApiRequest>(
