@@ -32,9 +32,14 @@ internal sealed class CopilotToolBridgeInferenceBridge(
         {
             var bridgeOptions = options.Value;
             var maxToolOutputChars = PositiveInt(bridgeOptions.MaxToolOutputChars, BridgeOptions.DefaultMaxToolOutputChars);
-            if (pendingToolCalls.TryFindOutputs(request, out var pendingToolOutputs, maxToolOutputChars))
+            var outputMatch = pendingToolCalls.FindOutputs(request, out var pendingToolOutputs, maxToolOutputChars);
+            if (outputMatch == PendingToolOutputMatchKind.Pending)
             {
                 await ContinuePendingToolCallsAsync(request, pendingToolOutputs, writer, operationToken);
+            }
+            else if (outputMatch == PendingToolOutputMatchKind.Retired)
+            {
+                logger.LogInformation("Ignoring stale Codex tool output for a completed or retired Copilot tool call.");
             }
             else
             {
@@ -183,8 +188,18 @@ internal sealed class CopilotToolBridgeInferenceBridge(
 
             if (state.WaitingForToolOutput)
             {
-                preserveStateOnError = true;
-                throw new InvalidOperationException("Reusable Copilot session is waiting for tool output, but this request did not include a matching tool output.");
+                if (!string.IsNullOrWhiteSpace(conversationKey))
+                {
+                    logger.LogInformation(
+                        "Restarting reusable Copilot session because it was waiting for tool output from a cancelled turn. ConversationKey={ConversationKey}",
+                        conversationKey);
+                    await RestartStateAsync();
+                }
+                else
+                {
+                    preserveStateOnError = true;
+                    throw new InvalidOperationException("Reusable Copilot session is waiting for tool output, but this request did not include a matching tool output.");
+                }
             }
 
             if (!state.CanReuse(model, reasoningEffort, toolSignature, request.Instructions) &&
@@ -273,6 +288,19 @@ internal sealed class CopilotToolBridgeInferenceBridge(
         }
         finally
         {
+            ValueTask disposal = default;
+            if (disposeState && state is not null)
+            {
+                if (!string.IsNullOrWhiteSpace(state.ConversationKey))
+                {
+                    state.MarkFaulted();
+                }
+
+                conversationSessions.RemoveForSession(state);
+                pendingToolCalls.RemoveForSession(state);
+                disposal = state.DisposeAsync();
+            }
+
             if (gateHeld)
             {
                 state?.CloseExchange(exchange);
@@ -294,17 +322,7 @@ internal sealed class CopilotToolBridgeInferenceBridge(
                     stateReserved = false;
                 }
 
-                if (!string.IsNullOrWhiteSpace(state.ConversationKey))
-                {
-                    state.MarkFaulted();
-                }
-
-                conversationSessions.RemoveForSession(state);
-                pendingToolCalls.RemoveForSession(state);
-                if (!state.IsActive)
-                {
-                    await state.DisposeAsync();
-                }
+                await disposal;
             }
             else if (stateReserved)
             {
@@ -314,13 +332,20 @@ internal sealed class CopilotToolBridgeInferenceBridge(
 
         async Task RestartStateAsync()
         {
-            state!.Gate.Release();
-            gateHeld = false;
+            var previousState = state!;
+            conversationSessions.RemoveForSession(previousState);
+            pendingToolCalls.RemoveForSession(previousState);
+            var disposal = previousState.DisposeAsync();
 
-            conversationSessions.RemoveForSession(state);
-            pendingToolCalls.RemoveForSession(state);
-            await state.DisposeAsync();
-            stateReserved = false;
+            previousState.Gate.Release();
+            gateHeld = false;
+            if (stateReserved)
+            {
+                previousState.ReleaseReservation();
+                stateReserved = false;
+            }
+
+            await disposal;
 
             state = await CreateCopilotStateAsync(
                 model,
@@ -330,6 +355,12 @@ internal sealed class CopilotToolBridgeInferenceBridge(
                 request.Instructions,
                 toolSignature,
                 cancellationToken);
+            if (!state.TryReserve())
+            {
+                throw new InvalidOperationException("Could not reserve a newly created Copilot bridge session.");
+            }
+
+            stateReserved = true;
             if (!string.IsNullOrWhiteSpace(conversationKey))
             {
                 await conversationSessions.AddOrReplaceAsync(state);
@@ -358,6 +389,11 @@ internal sealed class CopilotToolBridgeInferenceBridge(
             throw new InvalidOperationException("Matched Codex tool outputs belong to multiple Copilot bridge sessions.");
         }
 
+        if (!state.TryReserve())
+        {
+            return;
+        }
+
         var exchange = new BridgeExchange(writer, cancellationToken);
         var disposeState = false;
         var gateHeld = false;
@@ -366,7 +402,6 @@ internal sealed class CopilotToolBridgeInferenceBridge(
         {
             await state.Gate.WaitAsync(cancellationToken);
             gateHeld = true;
-
             var currentOutputs = pendingToolOutputs
                 .Where(output => pendingToolCalls.ContainsCallId(output.PendingCall.CallId))
                 .ToArray();
@@ -400,6 +435,11 @@ internal sealed class CopilotToolBridgeInferenceBridge(
             }
 
             state.UpdateRequestCursor(request);
+            if (state.WaitingForToolOutput)
+            {
+                return;
+            }
+
             await exchange.Done.Task.WaitAsync(cancellationToken);
 
             if (!exchange.HasUsage)
@@ -419,11 +459,19 @@ internal sealed class CopilotToolBridgeInferenceBridge(
         }
         catch
         {
-            disposeState = gateHeld && string.IsNullOrWhiteSpace(state.ConversationKey);
+            disposeState = gateHeld;
             throw;
         }
         finally
         {
+            ValueTask disposal = default;
+            if (disposeState)
+            {
+                conversationSessions.RemoveForSession(state);
+                pendingToolCalls.RemoveForSession(state);
+                disposal = state.DisposeAsync();
+            }
+
             if (gateHeld)
             {
                 state.CloseExchange(exchange);
@@ -434,9 +482,12 @@ internal sealed class CopilotToolBridgeInferenceBridge(
 
             if (disposeState)
             {
-                conversationSessions.RemoveForSession(state);
-                pendingToolCalls.RemoveForSession(state);
-                await state.DisposeAsync();
+                state.ReleaseReservation();
+                await disposal;
+            }
+            else
+            {
+                state.ReleaseReservation();
             }
         }
     }
@@ -513,13 +564,17 @@ internal sealed class CopilotToolBridgeInferenceBridge(
             instructionsFingerprint,
             toolSignature,
             cancellationToken);
+        if (!state.TryReserve())
+        {
+            throw new InvalidOperationException("Could not reserve a newly created Copilot bridge session.");
+        }
 
         if (!string.IsNullOrWhiteSpace(conversationKey))
         {
             await conversationSessions.AddOrReplaceAsync(state);
         }
 
-        return new ResolvedCopilotState(state, Reserved: false);
+        return new ResolvedCopilotState(state, Reserved: true);
     }
 
     private sealed record ResolvedCopilotState(CopilotBridgeState State, bool Reserved);
@@ -1096,12 +1151,11 @@ internal sealed class CopilotToolBridgeInferenceBridge(
         string toolSignature) : IReusableBridgeSession
     {
         private readonly object _sync = new();
-        private bool _disposed;
+        private readonly BridgeSessionLifetime _lifetime = new(session.DisposeAsync);
         private bool _faulted;
         private readonly HashSet<string> _pendingToolCallIds = new(StringComparer.Ordinal);
         private IReadOnlyList<string> _inputFingerprints = [];
         private long _lastSeenTicks = DateTimeOffset.UtcNow.UtcTicks;
-        private int _reservationCount;
 
         public CopilotSession Session { get; } = session;
 
@@ -1156,27 +1210,38 @@ internal sealed class CopilotToolBridgeInferenceBridge(
             {
                 lock (_sync)
                 {
-                    return CurrentExchange is not null || _reservationCount > 0;
+                    return CurrentExchange is not null || _lifetime.IsActive;
                 }
             }
         }
 
-        public void Reserve()
-        {
-            lock (_sync)
-            {
-                _reservationCount++;
-            }
-        }
+        public bool TryReserve() => _lifetime.TryReserve();
 
-        public void ReleaseReservation()
+        public void ReleaseReservation() => _lifetime.ReleaseReservation();
+
+        public bool TryRetireIfIdle()
         {
             lock (_sync)
             {
-                if (_reservationCount > 0)
+                if (_pendingToolCallIds.Count > 0 || CurrentExchange is not null)
                 {
-                    _reservationCount--;
+                    return false;
                 }
+
+                return _lifetime.TryRetireIfIdle();
+            }
+        }
+
+        public bool TryRetireForPendingToolExpiry()
+        {
+            lock (_sync)
+            {
+                if (CurrentExchange is not null)
+                {
+                    return false;
+                }
+
+                return _lifetime.TryRetireIfIdle();
             }
         }
 
@@ -1190,7 +1255,7 @@ internal sealed class CopilotToolBridgeInferenceBridge(
         {
             lock (_sync)
             {
-                return !_disposed &&
+                return !_lifetime.IsRetired &&
                     !_faulted &&
                     string.Equals(Model, model, StringComparison.Ordinal) &&
                     string.Equals(ReasoningEffort, reasoningEffort, StringComparison.Ordinal) &&
@@ -1268,20 +1333,6 @@ internal sealed class CopilotToolBridgeInferenceBridge(
             }
         }
 
-        public async ValueTask DisposeAsync()
-        {
-            lock (_sync)
-            {
-                if (_disposed)
-                {
-                    return;
-                }
-
-                _disposed = true;
-            }
-
-            await Session.DisposeAsync();
-            Gate.Dispose();
-        }
+        public ValueTask DisposeAsync() => _lifetime.DisposeAsync();
     }
 }

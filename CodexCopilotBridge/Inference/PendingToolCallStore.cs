@@ -39,19 +39,68 @@ internal sealed record PendingToolCallStoreSnapshot(
     int ActiveSessionCount,
     double? OldestPendingCallAgeSeconds);
 
+internal enum PendingToolOutputMatchKind
+{
+    None,
+    Pending,
+    Retired
+}
+
 internal sealed class PendingToolCallStore(
     ILogger<PendingToolCallStore> logger,
     ConversationSessionStore? conversationSessions = null) : IAsyncDisposable
 {
+    private readonly object _sync = new();
     private readonly ConcurrentDictionary<string, PendingToolCall> _pendingCalls = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, long> _retiredCallIds = new(StringComparer.Ordinal);
+    private int _disposed;
 
     public bool TryAdd(PendingToolCall pendingCall)
     {
-        pendingCall.Touch(DateTimeOffset.UtcNow);
-        return _pendingCalls.TryAdd(pendingCall.CallId, pendingCall);
+        lock (_sync)
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                return false;
+            }
+
+            pendingCall.Touch(DateTimeOffset.UtcNow);
+            if (!_pendingCalls.TryAdd(pendingCall.CallId, pendingCall))
+            {
+                return false;
+            }
+
+            return true;
+        }
     }
 
     public bool ContainsCallId(string callId) => _pendingCalls.ContainsKey(callId);
+
+    public bool ContainsTrailingRetiredOutput(ResponsesApiRequest request)
+    {
+        lock (_sync)
+        {
+            return ContainsTrailingRetiredOutputCore(request);
+        }
+    }
+
+    public PendingToolOutputMatchKind FindOutputs(
+        ResponsesApiRequest request,
+        out IReadOnlyList<PendingToolOutput> pendingToolOutputs,
+        int maxToolOutputChars = 0)
+    {
+        lock (_sync)
+        {
+            if (TryFindOutputsCore(request, out pendingToolOutputs, maxToolOutputChars))
+            {
+                return PendingToolOutputMatchKind.Pending;
+            }
+
+            return ContainsTrailingRetiredOutputCore(request)
+                ? PendingToolOutputMatchKind.Retired
+                : PendingToolOutputMatchKind.None;
+        }
+    }
 
     public bool TryTakeOutputs(
         ResponsesApiRequest request,
@@ -83,10 +132,10 @@ internal sealed class PendingToolCallStore(
                 continue;
             }
 
-            if (_pendingCalls.TryRemove(match.Pending.CallId, out var removed))
+            if (TryRemove(match.Pending))
             {
-                removed.Touch(DateTimeOffset.UtcNow);
-                outputs.Add(new PendingToolOutput(removed, match.Output!));
+                match.Pending.Touch(DateTimeOffset.UtcNow);
+                outputs.Add(new PendingToolOutput(match.Pending, match.Output!));
             }
         }
 
@@ -98,6 +147,17 @@ internal sealed class PendingToolCallStore(
         ResponsesApiRequest request,
         out IReadOnlyList<PendingToolOutput> pendingToolOutputs,
         int maxToolOutputChars = 0)
+    {
+        lock (_sync)
+        {
+            return TryFindOutputsCore(request, out pendingToolOutputs, maxToolOutputChars);
+        }
+    }
+
+    private bool TryFindOutputsCore(
+        ResponsesApiRequest request,
+        out IReadOnlyList<PendingToolOutput> pendingToolOutputs,
+        int maxToolOutputChars)
     {
         var matches = FindMatches(request, maxToolOutputChars);
 
@@ -111,36 +171,63 @@ internal sealed class PendingToolCallStore(
         return pendingToolOutputs.Count > 0;
     }
 
-    public bool TryRemove(PendingToolCall pendingCall) =>
-        ((ICollection<KeyValuePair<string, PendingToolCall>>)_pendingCalls)
-        .Remove(new KeyValuePair<string, PendingToolCall>(pendingCall.CallId, pendingCall));
+    public bool TryRemove(PendingToolCall pendingCall)
+    {
+        lock (_sync)
+        {
+            var removed = ((ICollection<KeyValuePair<string, PendingToolCall>>)_pendingCalls)
+                .Remove(new KeyValuePair<string, PendingToolCall>(pendingCall.CallId, pendingCall));
+            if (removed)
+            {
+                RetireCallId(pendingCall.CallId);
+            }
+
+            return removed;
+        }
+    }
 
     public int RemoveForSession(IPendingBridgeSession session)
     {
-        var removedCount = 0;
-        foreach (var pending in _pendingCalls)
+        lock (_sync)
         {
-            if (!ReferenceEquals(pending.Value.Session, session))
+            var removedCount = 0;
+            foreach (var pending in _pendingCalls)
             {
-                continue;
+                if (!ReferenceEquals(pending.Value.Session, session))
+                {
+                    continue;
+                }
+
+                if (_pendingCalls.TryRemove(pending.Key, out _))
+                {
+                    RetireCallId(pending.Key);
+                    removedCount++;
+                }
             }
 
-            if (_pendingCalls.TryRemove(pending.Key, out _))
-            {
-                removedCount++;
-            }
+            return removedCount;
         }
-
-        return removedCount;
     }
 
-    private Match[] FindMatches(ResponsesApiRequest request, int maxToolOutputChars) =>
-        _pendingCalls.Values
+    private Match[] FindMatches(ResponsesApiRequest request, int maxToolOutputChars)
+    {
+        var now = DateTimeOffset.UtcNow;
+        return _pendingCalls.Values
             .Select(pending => new Match(
                 pending,
-                ToolOutputReader.FindTextOutput(request, pending.CallId, maxToolOutputChars)))
-            .Where(match => match.Output is not null)
+                ToolOutputReader.FindTrailingTextOutput(request, pending.CallId, maxToolOutputChars)))
+            .Where(match =>
+            {
+                if (match.Output is null)
+                {
+                    return false;
+                }
+
+                match.Pending.Touch(now);
+                return true;
+            })
             .ToArray();
+    }
 
     private static IReadOnlyList<PendingToolOutput> SelectBestSessionOutputs(IReadOnlyList<Match> matches)
     {
@@ -182,33 +269,67 @@ internal sealed class PendingToolCallStore(
             ttl = TimeSpan.FromHours(1);
         }
 
-        var expired = _pendingCalls
+        lock (_sync)
+        {
+            foreach (var retiredCallId in _retiredCallIds)
+            {
+                if (now.UtcTicks - retiredCallId.Value >= ttl.Ticks)
+                {
+                    ((ICollection<KeyValuePair<string, long>>)_retiredCallIds).Remove(retiredCallId);
+                }
+            }
+        }
+
+        var expiredSessions = _pendingCalls
             .Where(pending => now - pending.Value.LastSeenAt >= ttl)
+            .Select(pending => pending.Value.Session)
+            .Distinct<IPendingBridgeSession>(ReferenceEqualityComparer.Instance)
             .ToArray();
-        var disposedSessions = new HashSet<IPendingBridgeSession>(ReferenceEqualityComparer.Instance);
         var removedCount = 0;
 
-        foreach (var candidate in expired)
+        foreach (var session in expiredSessions)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            if (!_pendingCalls.TryRemove(candidate.Key, out var removed))
+            PendingToolCall[] removedCalls;
+            lock (_sync)
             {
-                continue;
+                var stillExpired = _pendingCalls.Values.Any(pending =>
+                    ReferenceEquals(pending.Session, session) &&
+                    now - pending.LastSeenAt >= ttl);
+                if (!stillExpired ||
+                    session is IReusableBridgeSession reusableSession &&
+                    !reusableSession.TryRetireForPendingToolExpiry())
+                {
+                    continue;
+                }
+
+                removedCalls = _pendingCalls
+                    .Where(pending => ReferenceEquals(pending.Value.Session, session))
+                    .Select(pending => pending.Value)
+                    .ToArray();
+                foreach (var removed in removedCalls)
+                {
+                    if (((ICollection<KeyValuePair<string, PendingToolCall>>)_pendingCalls)
+                        .Remove(new KeyValuePair<string, PendingToolCall>(removed.CallId, removed)))
+                    {
+                        RetireCallId(removed.CallId);
+                        removedCount++;
+                    }
+                }
             }
 
-            removedCount++;
-            if (disposedSessions.Add(removed.Session))
+            foreach (var removed in removedCalls)
             {
-                conversationSessions?.RemoveForSession(removed.Session);
-                await removed.Session.DisposeAsync();
+                logger.LogWarning(
+                    "Expired pending Copilot tool call. CallId={CallId} Tool={ToolName} Model={Model}",
+                    removed.CallId,
+                    removed.Tool.CopilotName,
+                    removed.Session.Model);
             }
 
-            logger.LogWarning(
-                "Expired pending Copilot tool call. CallId={CallId} Tool={ToolName} Model={Model}",
-                removed.CallId,
-                removed.Tool.CopilotName,
-                removed.Session.Model);
+            conversationSessions?.RemoveForSession(session);
+            await session.DisposeAsync();
         }
 
         return removedCount;
@@ -216,8 +337,18 @@ internal sealed class PendingToolCallStore(
 
     public async ValueTask DisposeAsync()
     {
-        var pendingCalls = _pendingCalls.Values.ToArray();
-        _pendingCalls.Clear();
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+
+        PendingToolCall[] pendingCalls;
+        lock (_sync)
+        {
+            pendingCalls = _pendingCalls.Values.ToArray();
+            _pendingCalls.Clear();
+            _retiredCallIds.Clear();
+        }
 
         var disposedSessions = new HashSet<IPendingBridgeSession>(ReferenceEqualityComparer.Instance);
         foreach (var pending in pendingCalls)
@@ -229,4 +360,11 @@ internal sealed class PendingToolCallStore(
             }
         }
     }
+
+    private void RetireCallId(string callId) =>
+        _retiredCallIds[callId] = DateTimeOffset.UtcNow.UtcTicks;
+
+    private bool ContainsTrailingRetiredOutputCore(ResponsesApiRequest request) =>
+        ToolOutputReader.FindTrailingOutputCallIds(request)
+            .Any(callId => _retiredCallIds.ContainsKey(callId));
 }

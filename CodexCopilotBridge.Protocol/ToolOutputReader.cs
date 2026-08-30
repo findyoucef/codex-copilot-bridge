@@ -48,6 +48,54 @@ public static class ToolOutputReader
         return null;
     }
 
+    public static IReadOnlyList<string> FindTrailingOutputCallIds(ResponsesApiRequest request)
+    {
+        var callIds = new List<string>();
+        for (var index = request.Input.Count - 1; index >= 0; index--)
+        {
+            var item = request.Input[index];
+            if (!IsToolOutput(item))
+            {
+                break;
+            }
+
+            if (item.TryGetProperty("call_id", out var callIdElement) &&
+                callIdElement.GetString() is { Length: > 0 } callId)
+            {
+                callIds.Add(callId);
+            }
+        }
+
+        return callIds;
+    }
+
+    public static string? FindTrailingTextOutput(
+        ResponsesApiRequest request,
+        string callId,
+        int maxToolOutputChars = 0)
+    {
+        for (var index = request.Input.Count - 1; index >= 0; index--)
+        {
+            var item = request.Input[index];
+            if (!IsToolOutput(item))
+            {
+                break;
+            }
+
+            if (!item.TryGetProperty("call_id", out var callIdElement) ||
+                callIdElement.GetString() != callId)
+            {
+                continue;
+            }
+
+            return item.TryGetProperty("output", out var output)
+                ? ToolOutputText.Render(output, maxToolOutputChars)
+                : string.Empty;
+        }
+
+        return null;
+    }
+
     private static bool IsToolOutput(JsonElement item)
     {
         if (!item.TryGetProperty("type", out var typeElement))

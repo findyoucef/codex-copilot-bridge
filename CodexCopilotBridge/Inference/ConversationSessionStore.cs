@@ -14,9 +14,13 @@ internal interface IReusableBridgeSession : IPendingBridgeSession
 
     bool IsActive { get; }
 
-    void Reserve();
+    bool TryReserve();
 
     void ReleaseReservation();
+
+    bool TryRetireIfIdle();
+
+    bool TryRetireForPendingToolExpiry();
 
     void Touch(DateTimeOffset now);
 }
@@ -26,6 +30,115 @@ internal sealed record ConversationSessionStoreSnapshot(
     double? OldestSessionAgeSeconds,
     double? OldestIdleSessionAgeSeconds);
 
+internal sealed class BridgeSessionLifetime(Func<ValueTask> disposeSession)
+{
+    private readonly object _sync = new();
+    private int _reservationCount;
+    private bool _retired;
+    private TaskCompletionSource? _retiredAndIdle;
+    private Task? _disposeTask;
+
+    public bool IsActive
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _reservationCount > 0;
+            }
+        }
+    }
+
+    public bool IsRetired
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _retired;
+            }
+        }
+    }
+
+    public bool TryReserve()
+    {
+        lock (_sync)
+        {
+            if (_retired)
+            {
+                return false;
+            }
+
+            _reservationCount++;
+            return true;
+        }
+    }
+
+    public void ReleaseReservation()
+    {
+        TaskCompletionSource? retiredAndIdle = null;
+        lock (_sync)
+        {
+            if (_reservationCount > 0)
+            {
+                _reservationCount--;
+            }
+
+            if (_retired && _reservationCount == 0)
+            {
+                retiredAndIdle = _retiredAndIdle;
+            }
+        }
+
+        retiredAndIdle?.TrySetResult();
+    }
+
+    public bool TryRetireIfIdle()
+    {
+        lock (_sync)
+        {
+            if (_retired || _reservationCount > 0)
+            {
+                return false;
+            }
+
+            _retired = true;
+            return true;
+        }
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        Task disposeTask;
+        lock (_sync)
+        {
+            if (_disposeTask is not null)
+            {
+                return new ValueTask(_disposeTask);
+            }
+
+            _retired = true;
+            _retiredAndIdle = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            if (_reservationCount == 0)
+            {
+                _retiredAndIdle.TrySetResult();
+            }
+
+            _disposeTask = DisposeWhenIdleAsync(_retiredAndIdle.Task);
+            disposeTask = _disposeTask;
+        }
+
+        return new ValueTask(disposeTask);
+    }
+
+    private async Task DisposeWhenIdleAsync(Task retiredAndIdle)
+    {
+        await Task.Yield();
+        await retiredAndIdle;
+        await disposeSession();
+    }
+}
+
 internal sealed class ConversationSessionStore(ILogger<ConversationSessionStore> logger) : IAsyncDisposable
 {
     private readonly ConcurrentDictionary<string, IReusableBridgeSession> _sessions = new(StringComparer.Ordinal);
@@ -34,11 +147,16 @@ internal sealed class ConversationSessionStore(ILogger<ConversationSessionStore>
     {
         if (_sessions.TryGetValue(conversationKey, out session!))
         {
-            session.Touch(DateTimeOffset.UtcNow);
-            session.Reserve();
-            return true;
+            if (session.TryReserve())
+            {
+                session.Touch(DateTimeOffset.UtcNow);
+                return true;
+            }
+
+            TryRemove(conversationKey, session);
         }
 
+        session = null!;
         return false;
     }
 
@@ -135,14 +253,19 @@ internal sealed class ConversationSessionStore(ILogger<ConversationSessionStore>
             if (candidateSession.WaitingForToolOutput ||
                 candidateSession.IsActive ||
                 now - candidateSession.LastSeenAt < ttl ||
-                !TryRemove(candidate.Key, candidateSession))
+                !candidateSession.TryRetireIfIdle())
             {
+                continue;
+            }
+
+            if (!TryRemove(candidate.Key, candidateSession))
+            {
+                await candidateSession.DisposeAsync();
                 continue;
             }
 
             removedCount++;
             await candidateSession.DisposeAsync();
-
             logger.LogInformation(
                 "Expired reusable Copilot conversation session. ConversationKey={ConversationKey} Model={Model}",
                 candidateSession.ConversationKey,

@@ -70,6 +70,71 @@ public sealed class PendingToolCallStoreTests
     }
 
     [Fact]
+    public void TryFindOutputs_IgnoresHistoricalPendingOutputFollowedByUserInput()
+    {
+        var store = CreateStore();
+        var session = new FakeSession();
+        Assert.True(store.TryAdd(CreatePendingToolCall("call_1", session)));
+        var request = Request(
+            """
+            {
+              "type": "function_call_output",
+              "call_id": "call_1",
+              "output": "tool output"
+            }
+            """,
+            """
+            {
+              "type": "message",
+              "role": "user",
+              "content": [{ "type": "input_text", "text": "next turn" }]
+            }
+            """);
+
+        var found = store.TryFindOutputs(request, out var outputs);
+
+        Assert.False(found);
+        Assert.Empty(outputs);
+        Assert.Equal(1, store.Snapshot().PendingToolCallCount);
+    }
+
+    [Fact]
+    public void ContainsTrailingRetiredOutput_MatchesRemovedCallWithoutSuppressingLaterUserInput()
+    {
+        var store = CreateStore();
+        var session = new FakeSession();
+        var pending = CreatePendingToolCall("call_1", session);
+        Assert.True(store.TryAdd(pending));
+        Assert.True(store.TryRemove(pending));
+        var duplicate = Request(
+            """
+            {
+              "type": "function_call_output",
+              "call_id": "call_1",
+              "output": "tool output"
+            }
+            """);
+        var laterTurn = Request(
+            """
+            {
+              "type": "function_call_output",
+              "call_id": "call_1",
+              "output": "tool output"
+            }
+            """,
+            """
+            {
+              "type": "message",
+              "role": "user",
+              "content": [{ "type": "input_text", "text": "next turn" }]
+            }
+            """);
+
+        Assert.True(store.ContainsTrailingRetiredOutput(duplicate));
+        Assert.False(store.ContainsTrailingRetiredOutput(laterTurn));
+    }
+
+    [Fact]
     public void TryTakeOutputs_ReturnsAllMatchingPendingCallsForOneSession()
     {
         var store = CreateStore();
@@ -183,6 +248,32 @@ public sealed class PendingToolCallStoreTests
     }
 
     [Fact]
+    public async Task ExpireAsync_RemovesFreshSiblingCallsWithRetiredSession()
+    {
+        var store = CreateStore();
+        var session = new FakeSession();
+        var oldCall = CreatePendingToolCall(
+            "call_old",
+            session,
+            DateTimeOffset.UtcNow.AddMinutes(-20));
+        var freshCall = CreatePendingToolCall(
+            "call_fresh",
+            session);
+        Assert.True(store.TryAdd(oldCall));
+        Assert.True(store.TryAdd(freshCall));
+        oldCall.Touch(DateTimeOffset.UtcNow.AddMinutes(-20));
+
+        var expired = await store.ExpireAsync(
+            DateTimeOffset.UtcNow,
+            TimeSpan.FromMinutes(10),
+            CancellationToken.None);
+
+        Assert.Equal(2, expired);
+        Assert.Equal(1, session.DisposeCount);
+        Assert.Equal(0, store.Snapshot().PendingToolCallCount);
+    }
+
+    [Fact]
     public void Snapshot_ReturnsPendingAndActiveSessionCounts()
     {
         var store = CreateStore();
@@ -203,7 +294,20 @@ public sealed class PendingToolCallStoreTests
     private static PendingToolCallStore CreateStore() =>
         new(NullLogger<PendingToolCallStore>.Instance);
 
-    private static PendingToolCall CreatePendingToolCall(string callId, FakeSession session) =>
+    private static ResponsesApiRequest Request(params string[] inputItems) =>
+        JsonSerializer.Deserialize<ResponsesApiRequest>(
+            $$"""
+            {
+              "model": "gpt-5.5",
+              "input": [{{string.Join(",", inputItems)}}]
+            }
+            """,
+            ProtocolJson.SerializerOptions)!;
+
+    private static PendingToolCall CreatePendingToolCall(
+        string callId,
+        FakeSession session,
+        DateTimeOffset? createdAt = null) =>
         new(
             callId,
             $"request_{callId}",
@@ -214,7 +318,7 @@ public sealed class PendingToolCallStoreTests
                 null,
                 "Run a command.",
                 EmptyParametersSchema()),
-            DateTimeOffset.UtcNow);
+            createdAt ?? DateTimeOffset.UtcNow);
 
     private static JsonElement EmptyParametersSchema() =>
         JsonSerializer.Deserialize<JsonElement>(

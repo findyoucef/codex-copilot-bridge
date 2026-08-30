@@ -124,6 +124,20 @@ public sealed class ConversationSessionStoreTests
         Assert.Same(newSession, stored);
     }
 
+    [Fact]
+    public async Task TryGet_RemovesSessionThatHasStartedRetiring()
+    {
+        var store = CreateStore();
+        var session = new FakeReusableSession("thread:one", DateTimeOffset.UtcNow);
+        await store.AddOrReplaceAsync(session);
+        Assert.True(session.TryRetireIfIdle());
+
+        var found = store.TryGet("thread:one", out _);
+
+        Assert.False(found);
+        Assert.Equal(0, store.Snapshot().ActiveSessionCount);
+    }
+
     private static ConversationSessionStore CreateStore() =>
         new(NullLogger<ConversationSessionStore>.Instance);
 
@@ -131,6 +145,7 @@ public sealed class ConversationSessionStoreTests
     {
         private long _lastSeenTicks = lastSeenAt.UtcTicks;
         private int _reservationCount;
+        private bool _retired;
 
         public string ConversationKey { get; } = conversationKey;
 
@@ -148,9 +163,15 @@ public sealed class ConversationSessionStoreTests
 
         public int DisposeCount { get; private set; }
 
-        public void Reserve()
+        public bool TryReserve()
         {
+            if (_retired)
+            {
+                return false;
+            }
+
             _reservationCount++;
+            return true;
         }
 
         public void ReleaseReservation()
@@ -160,6 +181,20 @@ public sealed class ConversationSessionStoreTests
                 _reservationCount--;
             }
         }
+
+        public bool TryRetireIfIdle()
+        {
+            if (_retired || WaitingForToolOutput || IsActive)
+            {
+                return false;
+            }
+
+            _retired = true;
+            return true;
+        }
+
+        public bool TryRetireForPendingToolExpiry() =>
+            TryRetireIfIdle();
 
         public void Touch(DateTimeOffset now) => Interlocked.Exchange(ref _lastSeenTicks, now.UtcTicks);
 
