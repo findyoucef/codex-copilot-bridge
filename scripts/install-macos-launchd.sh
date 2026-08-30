@@ -7,6 +7,7 @@ SOURCE_DIR="${1:-$ROOT_DIR/artifacts/publish/codex-copilot-bridge-osx-arm64}"
 INSTALL_DIR="${CODEX_COPILOT_BRIDGE_INSTALL_DIR:-$HOME/.local/share/codex-copilot-bridge}"
 PORT="${CODEX_COPILOT_BRIDGE_PORT:-17776}"
 LOG_DIR="${CODEX_COPILOT_BRIDGE_LOG_DIR:-$HOME/Library/Logs/codex-copilot-bridge}"
+BIN_DIR="${CODEX_COPILOT_BRIDGE_BIN_DIR:-$HOME/.local/bin}"
 PLIST_TEMPLATE="$ROOT_DIR/ops/launchd/$LABEL.plist"
 PLIST_PATH="$HOME/Library/LaunchAgents/$LABEL.plist"
 GUI_DOMAIN="gui/$(id -u)"
@@ -37,6 +38,12 @@ mkdir -p "$INSTALL_DIR"
 ditto "$SOURCE_DIR" "$INSTALL_DIR"
 chmod +x "$INSTALL_DIR/CodexCopilotBridge"
 
+if [[ -f "$SOURCE_DIR/codex-copilot" ]]; then
+  mkdir -p "$BIN_DIR"
+  cp "$SOURCE_DIR/codex-copilot" "$BIN_DIR/codex-copilot"
+  chmod +x "$BIN_DIR/codex-copilot"
+fi
+
 sed \
   -e "s#__INSTALL_DIR__#$(escape_sed "$INSTALL_DIR")#g" \
   -e "s#__LOG_DIR__#$(escape_sed "$LOG_DIR")#g" \
@@ -51,3 +58,6 @@ launchctl kickstart -k "$GUI_DOMAIN/$LABEL"
 echo "Installed $LABEL"
 echo "URL: http://127.0.0.1:$PORT"
 echo "Logs: $LOG_DIR"
+if [[ -x "$BIN_DIR/codex-copilot" ]]; then
+  echo "Codex launcher: $BIN_DIR/codex-copilot"
+fi

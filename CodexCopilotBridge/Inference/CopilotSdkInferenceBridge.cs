@@ -35,6 +35,7 @@ public sealed class CopilotSdkInferenceBridge(IOptions<BridgeOptions> options, I
 
             var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             var finalText = string.Empty;
+            var hasUsage = false;
 
             void WriteOutput(BridgeOutput bridgeOutput)
             {
@@ -62,6 +63,36 @@ public sealed class CopilotSdkInferenceBridge(IOptions<BridgeOptions> options, I
                     case AssistantMessageEvent message:
                         finalText = message.Data.Content ?? string.Empty;
                         break;
+                    case AssistantUsageEvent usage:
+                        var usageOutput = UsageOutput.FromProvider(
+                            usage.Data.InputTokens,
+                            usage.Data.CacheReadTokens,
+                            usage.Data.CacheWriteTokens,
+                            usage.Data.OutputTokens,
+                            usage.Data.ReasoningTokens);
+                        if (usageOutput is null)
+                        {
+                            logger.LogWarning(
+                                "Copilot usage event omitted required token counts. Model={Model} ApiCallId={ApiCallId}",
+                                usage.Data.Model,
+                                usage.Data.ApiCallId);
+                        }
+                        else
+                        {
+                            WriteOutput(usageOutput);
+                            hasUsage = true;
+                        }
+                        break;
+                    case SessionUsageInfoEvent contextUsage:
+                        logger.LogInformation(
+                            "Copilot context usage. Model={Model} CurrentTokens={CurrentTokens} TokenLimit={TokenLimit} ConversationTokens={ConversationTokens} SystemTokens={SystemTokens} ToolDefinitionTokens={ToolDefinitionTokens}",
+                            model,
+                            contextUsage.Data.CurrentTokens,
+                            contextUsage.Data.TokenLimit,
+                            contextUsage.Data.ConversationTokens,
+                            contextUsage.Data.SystemTokens,
+                            contextUsage.Data.ToolDefinitionsTokens);
+                        break;
                     case SessionErrorEvent error:
                         done.TrySetException(new InvalidOperationException(error.Data.Message));
                         break;
@@ -73,6 +104,11 @@ public sealed class CopilotSdkInferenceBridge(IOptions<BridgeOptions> options, I
 
             await session.SendAsync(new MessageOptions { Prompt = prompt }, operationToken);
             await done.Task.WaitAsync(operationToken);
+            if (!hasUsage)
+            {
+                logger.LogWarning("Copilot did not report token usage for SDK exchange. Model={Model}", model);
+            }
+
             await writer.WriteAsync(new FinalTextOutput(finalText), operationToken);
         }, cancellationToken))
         {

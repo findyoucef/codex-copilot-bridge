@@ -133,7 +133,7 @@ public static class ResponsesEvents
         };
     }
 
-    public static object Completed(string responseId, bool endTurn = true) =>
+    public static object Completed(string responseId, bool endTurn = true, object? usage = null) =>
         new
         {
             Type = "response.completed",
@@ -141,7 +141,8 @@ public static class ResponsesEvents
             {
                 Id = responseId,
                 Status = "completed",
-                EndTurn = endTurn
+                EndTurn = endTurn,
+                Usage = usage
             }
         };
 

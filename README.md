@@ -157,9 +157,6 @@ Codex profiles live in `~/.codex/<profile-name>.config.toml`. Create a `copilot-
 ```bash
 mkdir -p "$HOME/.codex"
 
-curl -fsS http://127.0.0.1:17776/v1/models \
-  -o "$HOME/.codex/copilot-bridge-models.json"
-
 cat > "$HOME/.codex/copilot-bridge.config.toml" <<EOF
 model = "gpt-5.6-sol"
 model_provider = "github-copilot-bridge"
@@ -176,16 +173,16 @@ stream_idle_timeout_ms = 3600000
 EOF
 ```
 
-Codex loads custom-provider model metadata from `model_catalog_json`; it does not use the bridge's `/v1/models` response automatically. Refresh the saved catalog after changing `Bridge:DefaultModel`, and keep the profile `model` equal to `Bridge:DefaultModel`.
+Codex loads custom-provider model metadata from `model_catalog_json` only at startup; it does not query the bridge directly. The installed `codex-copilot` launcher queries Copilot for the models available to the authenticated account, refreshes that catalog atomically, and then starts Codex with this profile. The profile's `model` is only the initial selection.
 
-Use the profile directly:
+Start Copilot-backed Codex and use `/model` to switch among the discovered models:
 
 ```bash
-codex --profile copilot-bridge
-codex exec --profile copilot-bridge "Reply exactly: copilot-profile-ok"
+codex-copilot
+codex-copilot exec "Reply exactly: copilot-profile-ok"
 ```
 
-Plain `codex` and `codex exec` still use your normal Codex provider.
+Set `CODEX_COPILOT_BRIDGE_URL`, `CODEX_COPILOT_MODEL_CATALOG`, or `CODEX_COPILOT_PROFILE` to override the launcher's defaults. Plain `codex` and `codex exec` still use your normal Codex provider.
 
 ### 4. Optional zsh helpers
 
@@ -194,11 +191,11 @@ These helpers make switching explicit without changing your default Codex config
 ```bash
 cat > "$HOME/.codex-copilot-bridge.zsh" <<'EOF'
 codex-copilot() {
-  command codex --profile copilot-bridge "$@"
+  command "$HOME/.local/bin/codex-copilot" "$@"
 }
 
 codex-copilot-exec() {
-  command codex exec --profile copilot-bridge "$@"
+  command "$HOME/.local/bin/codex-copilot" exec "$@"
 }
 
 codex-default() {
@@ -320,7 +317,7 @@ Set `Bridge:Mode` to `Echo` to test the Codex provider contract without spending
 
 Set `Bridge:Mode` to `CopilotSdk` for text-only Copilot streaming without tool bridging.
 
-The default profile and bridge fallback use `gpt-5.6-sol`. If Copilot rejects that model for your account, set the profile `model` and `Bridge:DefaultModel` to another Copilot-supported model slug, then refresh `~/.codex/copilot-bridge-models.json` from `/v1/models`.
+The default profile and bridge fallback use `gpt-5.6-sol`. `/v1/models` queries the Copilot SDK for the authenticated account's current model list, context limits, and reasoning efforts. The `codex-copilot` launcher refreshes `~/.codex/copilot-bridge-models.json` before every new Codex process so `/model` stays current. Context windows are capped by `Bridge:CodexContextWindow` because Copilot's model metadata may also advertise separately priced long-context tiers that the bridge does not request.
 
 ```bash
 dotnet test
@@ -365,13 +362,32 @@ The probe verifies Copilot external-tool request/response handling through the s
     "RequestTimeout": "01:00:00",
     "PendingToolCallTtl": "01:00:00",
     "PendingToolCallCleanupInterval": "00:01:00",
+    "ConversationSessionTtl": "02:00:00",
     "ToolRequestBatchQuietPeriod": "00:00:00.500",
-    "ResponseOutputChannelCapacity": 512
+    "ResponseOutputChannelCapacity": 512,
+    "CodexContextWindow": 272000,
+    "CodexTruncationLimitBytes": 10000000,
+    "MaxToolOutputChars": 20000,
+    "CompactToolSchemas": true,
+    "EnableConversationSessionReuse": true,
+    "ExcludedToolNames": [
+      "view_image",
+      "update_plan"
+    ],
+    "ExcludedToolNamePrefixes": []
   }
 }
 ```
 
 `RequestTimeout` caps each active `/v1/responses` bridge operation. `PendingToolCallTtl` caps how long a Copilot session can wait for Codex to return tool output, including long-running local shell commands. The cleanup service disposes expired sessions on `PendingToolCallCleanupInterval`. `ToolRequestBatchQuietPeriod` waits briefly for adjacent parallel Copilot tool calls before returning them to Codex. `ResponseOutputChannelCapacity` bounds queued stream events so slow clients apply backpressure instead of allowing unbounded memory growth.
+
+Cost controls: `CodexContextWindow` and `CodexTruncationLimitBytes` are advertised in `/v1/models` so Codex sends less history to each fresh bridge session. Keep `CodexContextWindow` aligned with the Copilot SDK's reported provider token limit; the default is `272000`. `MaxToolOutputChars` limits text returned from local tools to Copilot, while non-text tool payloads are omitted. `CompactToolSchemas` strips verbose schema annotations, and declarations are marked deferable so Copilot tool search loads large tool catalogs on demand instead of placing every schema in each model prompt. `ExcludedToolNames` and `ExcludedToolNamePrefixes` prevent tools from being advertised to Copilot; by default the bridge excludes `view_image` because image payloads are not forwarded as images, and `update_plan` because it adds tool turns without improving model context.
+
+Copilot SDK `assistant.usage` events are returned through the standard Responses `usage` object, including input, cached-input, cache-write, output, and reasoning token counts. Multiple Copilot API calls made during one bridge response are summed for that response; reusable sessions do not carry earlier response totals forward. If Copilot omits required input or output counts, the bridge omits `usage` and logs a warning instead of estimating.
+
+The bridge also logs Copilot `session.usage_info` context statistics, including the current provider-context token count and provider token limit. `CodexContextWindow` is the planning limit advertised to Codex; if the logged provider limit changes, update the setting and refresh Codex's saved model catalog so Codex compacts before reaching the provider boundary.
+
+When `EnableConversationSessionReuse` is on, the bridge uses Codex's `thread_id`/`session_id` metadata to keep a reusable Copilot session per Codex conversation. Follow-up turns send only new user/developer input instead of replaying the full Codex history. `ConversationSessionTtl` expires idle reusable sessions; pending tool-call sessions are still governed by `PendingToolCallTtl`.
 
 ## CI
 

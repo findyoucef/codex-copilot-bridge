@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Nodes;
 
 namespace CodexCopilotBridge.Protocol;
 
@@ -9,15 +10,27 @@ public sealed record CodexToolDeclaration(
     string Description,
     JsonElement Parameters);
 
+public sealed record CodexToolReaderOptions
+{
+    public bool CompactSchemas { get; init; }
+
+    public IReadOnlySet<string> ExcludedToolNames { get; init; } = new HashSet<string>(StringComparer.Ordinal);
+
+    public IReadOnlyList<string> ExcludedToolNamePrefixes { get; init; } = [];
+}
+
 public static class CodexToolReader
 {
-    public static IReadOnlyList<CodexToolDeclaration> ReadToolDeclarations(ResponsesApiRequest request)
+    public static IReadOnlyList<CodexToolDeclaration> ReadToolDeclarations(
+        ResponsesApiRequest request,
+        CodexToolReaderOptions? options = null)
     {
         if (request.Tools is not { Count: > 0 })
         {
             return [];
         }
 
+        options ??= new CodexToolReaderOptions();
         var declarations = new List<CodexToolDeclaration>();
         var seenCopilotNames = new HashSet<string>(StringComparer.Ordinal);
         foreach (var tool in request.Tools)
@@ -30,10 +43,10 @@ public static class CodexToolReader
             switch (typeElement.GetString())
             {
                 case "function":
-                    AddFunctionDeclaration(tool, codexNamespace: null, namespaceDescription: null, declarations, seenCopilotNames);
+                    AddFunctionDeclaration(tool, codexNamespace: null, namespaceDescription: null, declarations, seenCopilotNames, options);
                     break;
                 case "namespace":
-                    AddNamespaceDeclarations(tool, declarations, seenCopilotNames);
+                    AddNamespaceDeclarations(tool, declarations, seenCopilotNames, options);
                     break;
             }
         }
@@ -44,7 +57,8 @@ public static class CodexToolReader
     private static void AddNamespaceDeclarations(
         JsonElement namespaceTool,
         List<CodexToolDeclaration> declarations,
-        HashSet<string> seenCopilotNames)
+        HashSet<string> seenCopilotNames,
+        CodexToolReaderOptions options)
     {
         if (!TryGetString(namespaceTool, "name", out var namespaceName) ||
             !namespaceTool.TryGetProperty("tools", out var tools) ||
@@ -65,7 +79,7 @@ public static class CodexToolReader
                 continue;
             }
 
-            AddFunctionDeclaration(tool, namespaceName, namespaceDescription, declarations, seenCopilotNames);
+            AddFunctionDeclaration(tool, namespaceName, namespaceDescription, declarations, seenCopilotNames, options);
         }
     }
 
@@ -74,7 +88,8 @@ public static class CodexToolReader
         string? codexNamespace,
         string? namespaceDescription,
         List<CodexToolDeclaration> declarations,
-        HashSet<string> seenCopilotNames)
+        HashSet<string> seenCopilotNames,
+        CodexToolReaderOptions options)
     {
         if (!TryGetString(tool, "name", out var name))
         {
@@ -82,6 +97,11 @@ public static class CodexToolReader
         }
 
         var copilotName = FlattenToolName(codexNamespace, name);
+        if (IsExcluded(copilotName, name, options))
+        {
+            return;
+        }
+
         if (!seenCopilotNames.Add(copilotName))
         {
             return;
@@ -95,7 +115,7 @@ public static class CodexToolReader
             .Where(part => !string.IsNullOrWhiteSpace(part));
 
         var parameters = tool.TryGetProperty("parameters", out var parameterElement)
-            ? parameterElement.Clone()
+            ? ReadParametersSchema(parameterElement, options.CompactSchemas)
             : EmptyParametersSchema();
 
         declarations.Add(new CodexToolDeclaration(
@@ -104,6 +124,19 @@ public static class CodexToolReader
             codexNamespace,
             string.Join(Environment.NewLine, descriptionParts),
             parameters));
+    }
+
+    private static bool IsExcluded(string copilotName, string codexName, CodexToolReaderOptions options)
+    {
+        if (options.ExcludedToolNames.Contains(copilotName) ||
+            options.ExcludedToolNames.Contains(codexName))
+        {
+            return true;
+        }
+
+        return options.ExcludedToolNamePrefixes.Any(prefix =>
+            !string.IsNullOrWhiteSpace(prefix) &&
+            copilotName.StartsWith(prefix, StringComparison.Ordinal));
     }
 
     private static bool TryGetString(JsonElement element, string propertyName, out string value)
@@ -130,6 +163,52 @@ public static class CodexToolReader
             ? $"{codexNamespace}{name}"
             : $"{codexNamespace}__{name}";
     }
+
+    private static JsonElement ReadParametersSchema(JsonElement parameters, bool compactSchemas)
+    {
+        if (!compactSchemas)
+        {
+            return parameters.Clone();
+        }
+
+        var node = JsonNode.Parse(parameters.GetRawText());
+        if (node is null)
+        {
+            return parameters.Clone();
+        }
+
+        RemoveSchemaAnnotations(node);
+        return JsonSerializer.SerializeToElement(node, ProtocolJson.SerializerOptions);
+    }
+
+    private static void RemoveSchemaAnnotations(JsonNode? node, bool isSchemaMap = false)
+    {
+        switch (node)
+        {
+            case JsonObject schema:
+                if (!isSchemaMap)
+                {
+                    schema.Remove("description");
+                    schema.Remove("title");
+                    schema.Remove("examples");
+                }
+
+                foreach (var property in schema.ToArray())
+                {
+                    RemoveSchemaAnnotations(property.Value, IsSchemaMapProperty(property.Key));
+                }
+                break;
+            case JsonArray array:
+                foreach (var item in array)
+                {
+                    RemoveSchemaAnnotations(item);
+                }
+                break;
+        }
+    }
+
+    private static bool IsSchemaMapProperty(string propertyName) =>
+        propertyName is "properties" or "patternProperties" or "$defs" or "definitions" or "dependentSchemas";
 
     private static JsonElement EmptyParametersSchema() =>
         JsonSerializer.Deserialize<JsonElement>(

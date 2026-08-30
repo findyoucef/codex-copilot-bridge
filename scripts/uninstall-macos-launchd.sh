@@ -4,6 +4,7 @@ set -euo pipefail
 LABEL="com.findyoucef.codex-copilot-bridge"
 INSTALL_DIR="${CODEX_COPILOT_BRIDGE_INSTALL_DIR:-$HOME/.local/share/codex-copilot-bridge}"
 LOG_DIR="${CODEX_COPILOT_BRIDGE_LOG_DIR:-$HOME/Library/Logs/codex-copilot-bridge}"
+BIN_DIR="${CODEX_COPILOT_BRIDGE_BIN_DIR:-$HOME/.local/bin}"
 PLIST_PATH="$HOME/Library/LaunchAgents/$LABEL.plist"
 GUI_DOMAIN="gui/$(id -u)"
 
@@ -20,6 +21,7 @@ rm -f "$PLIST_PATH"
 
 if [[ "${1:-}" == "--remove-files" ]]; then
   rm -rf "$INSTALL_DIR" "$LOG_DIR"
+  rm -f "$BIN_DIR/codex-copilot"
   echo "Removed service, install directory, and logs."
 else
   echo "Removed service. Pass --remove-files to remove $INSTALL_DIR and $LOG_DIR."

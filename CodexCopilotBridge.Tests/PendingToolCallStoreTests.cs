@@ -39,6 +39,37 @@ public sealed class PendingToolCallStoreTests
     }
 
     [Fact]
+    public void TryFindOutputs_ReturnsMatchingPendingCallWithoutRemovingIt()
+    {
+        var store = CreateStore();
+        var session = new FakeSession();
+        var pending = CreatePendingToolCall("call_1", session);
+        Assert.True(store.TryAdd(pending));
+        var request = JsonSerializer.Deserialize<ResponsesApiRequest>(
+            """
+            {
+              "model": "gpt-5.5",
+              "input": [
+                {
+                  "type": "function_call_output",
+                  "call_id": "call_1",
+                  "output": "tool output"
+                }
+              ]
+            }
+            """,
+            ProtocolJson.SerializerOptions);
+
+        var found = store.TryFindOutputs(request!, out var outputs);
+
+        Assert.True(found);
+        var output = Assert.Single(outputs);
+        Assert.Same(pending, output.PendingCall);
+        Assert.Equal("tool output", output.Output);
+        Assert.Equal(1, store.Snapshot().PendingToolCallCount);
+    }
+
+    [Fact]
     public void TryTakeOutputs_ReturnsAllMatchingPendingCallsForOneSession()
     {
         var store = CreateStore();

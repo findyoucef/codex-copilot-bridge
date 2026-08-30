@@ -21,6 +21,7 @@ public static class SseResponseWriter
         var textItemCompleted = false;
         var emittedText = false;
         var emittedToolCall = false;
+        UsageOutput? usage = null;
         var nextOutputIndex = 0;
         int? textOutputIndex = null;
 
@@ -57,6 +58,9 @@ public static class SseResponseWriter
 
                         emittedText = emittedText || !string.IsNullOrEmpty(final.Text);
                         break;
+                    case UsageOutput currentUsage:
+                        usage = usage is null ? currentUsage : usage.Add(currentUsage);
+                        break;
                     case FunctionCallRequestOutput functionCall:
                         await CompleteTextItemIfNeededAsync();
                         emittedToolCall = true;
@@ -77,7 +81,11 @@ public static class SseResponseWriter
 
             await CompleteTextItemIfNeededAsync();
 
-            await WriteEventAsync(context, "response.completed", ResponsesEvents.Completed(responseId, endTurn: !emittedToolCall), cancellationToken);
+            await WriteEventAsync(
+                context,
+                "response.completed",
+                ResponsesEvents.Completed(responseId, endTurn: !emittedToolCall, usage: usage?.ToResponseUsage()),
+                cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {

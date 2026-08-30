@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BRIDGE_URL="${CODEX_COPILOT_BRIDGE_URL:-http://127.0.0.1:17776}"
+CATALOG_PATH="${CODEX_COPILOT_MODEL_CATALOG:-$HOME/.codex/copilot-bridge-models.json}"
+PROFILE="${CODEX_COPILOT_PROFILE:-copilot-bridge}"
+CODEX_BIN="${CODEX_BIN:-codex}"
+
+mkdir -p "$(dirname "$CATALOG_PATH")"
+TEMP_CATALOG="$(mktemp "${CATALOG_PATH}.tmp.XXXXXX")"
+trap 'rm -f "$TEMP_CATALOG"' EXIT
+
+curl --fail --silent --show-error "$BRIDGE_URL/v1/models" --output "$TEMP_CATALOG"
+mv "$TEMP_CATALOG" "$CATALOG_PATH"
+trap - EXIT
+
+exec "$CODEX_BIN" --profile "$PROFILE" "$@"

@@ -39,7 +39,9 @@ internal sealed record PendingToolCallStoreSnapshot(
     int ActiveSessionCount,
     double? OldestPendingCallAgeSeconds);
 
-internal sealed class PendingToolCallStore(ILogger<PendingToolCallStore> logger) : IAsyncDisposable
+internal sealed class PendingToolCallStore(
+    ILogger<PendingToolCallStore> logger,
+    ConversationSessionStore? conversationSessions = null) : IAsyncDisposable
 {
     private readonly ConcurrentDictionary<string, PendingToolCall> _pendingCalls = new(StringComparer.Ordinal);
 
@@ -51,16 +53,12 @@ internal sealed class PendingToolCallStore(ILogger<PendingToolCallStore> logger)
 
     public bool ContainsCallId(string callId) => _pendingCalls.ContainsKey(callId);
 
-    public bool TryTakeOutputs(ResponsesApiRequest request, out IReadOnlyList<PendingToolOutput> pendingToolOutputs)
+    public bool TryTakeOutputs(
+        ResponsesApiRequest request,
+        out IReadOnlyList<PendingToolOutput> pendingToolOutputs,
+        int maxToolOutputChars = 0)
     {
-        var matches = _pendingCalls.Values
-            .Select(pending => new
-            {
-                Pending = pending,
-                Output = ToolOutputReader.FindTextOutput(request, pending.CallId)
-            })
-            .Where(match => match.Output is not null)
-            .ToArray();
+        var matches = FindMatches(request, maxToolOutputChars);
 
         if (matches.Length == 0)
         {
@@ -96,6 +94,27 @@ internal sealed class PendingToolCallStore(ILogger<PendingToolCallStore> logger)
         return outputs.Count > 0;
     }
 
+    public bool TryFindOutputs(
+        ResponsesApiRequest request,
+        out IReadOnlyList<PendingToolOutput> pendingToolOutputs,
+        int maxToolOutputChars = 0)
+    {
+        var matches = FindMatches(request, maxToolOutputChars);
+
+        if (matches.Length == 0)
+        {
+            pendingToolOutputs = [];
+            return false;
+        }
+
+        pendingToolOutputs = SelectBestSessionOutputs(matches);
+        return pendingToolOutputs.Count > 0;
+    }
+
+    public bool TryRemove(PendingToolCall pendingCall) =>
+        ((ICollection<KeyValuePair<string, PendingToolCall>>)_pendingCalls)
+        .Remove(new KeyValuePair<string, PendingToolCall>(pendingCall.CallId, pendingCall));
+
     public int RemoveForSession(IPendingBridgeSession session)
     {
         var removedCount = 0;
@@ -114,6 +133,32 @@ internal sealed class PendingToolCallStore(ILogger<PendingToolCallStore> logger)
 
         return removedCount;
     }
+
+    private Match[] FindMatches(ResponsesApiRequest request, int maxToolOutputChars) =>
+        _pendingCalls.Values
+            .Select(pending => new Match(
+                pending,
+                ToolOutputReader.FindTextOutput(request, pending.CallId, maxToolOutputChars)))
+            .Where(match => match.Output is not null)
+            .ToArray();
+
+    private static IReadOnlyList<PendingToolOutput> SelectBestSessionOutputs(IReadOnlyList<Match> matches)
+    {
+        var sessionCounts = new Dictionary<IPendingBridgeSession, int>(ReferenceEqualityComparer.Instance);
+        foreach (var match in matches)
+        {
+            sessionCounts.TryGetValue(match.Pending.Session, out var count);
+            sessionCounts[match.Pending.Session] = count + 1;
+        }
+
+        var session = sessionCounts.MaxBy(match => match.Value).Key;
+        return matches
+            .Where(match => ReferenceEquals(match.Pending.Session, session))
+            .Select(match => new PendingToolOutput(match.Pending, match.Output!))
+            .ToArray();
+    }
+
+    private sealed record Match(PendingToolCall Pending, string? Output);
 
     public PendingToolCallStoreSnapshot Snapshot(DateTimeOffset? now = null)
     {
@@ -155,6 +200,7 @@ internal sealed class PendingToolCallStore(ILogger<PendingToolCallStore> logger)
             removedCount++;
             if (disposedSessions.Add(removed.Session))
             {
+                conversationSessions?.RemoveForSession(removed.Session);
                 await removed.Session.DisposeAsync();
             }
 
@@ -178,6 +224,7 @@ internal sealed class PendingToolCallStore(ILogger<PendingToolCallStore> logger)
         {
             if (disposedSessions.Add(pending.Session))
             {
+                conversationSessions?.RemoveForSession(pending.Session);
                 await pending.Session.DisposeAsync();
             }
         }

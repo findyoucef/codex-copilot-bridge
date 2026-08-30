@@ -5,7 +5,10 @@ namespace CodexCopilotBridge.Protocol;
 
 public static class CodexPromptRenderer
 {
-    public static string Render(ResponsesApiRequest request, bool includeToolNotice = true)
+    public static string Render(
+        ResponsesApiRequest request,
+        bool includeToolNotice = true,
+        int maxToolOutputChars = 0)
     {
         var builder = new StringBuilder();
 
@@ -20,7 +23,7 @@ public static class CodexPromptRenderer
 
         foreach (var item in request.Input)
         {
-            AppendInputItem(builder, item);
+            AppendInputItem(builder, item, maxToolOutputChars);
         }
 
         if (includeToolNotice && request.Tools is { Count: > 0 })
@@ -32,7 +35,57 @@ public static class CodexPromptRenderer
         return builder.ToString().Trim();
     }
 
-    private static void AppendInputItem(StringBuilder builder, JsonElement item)
+    public static string RenderDelta(
+        ResponsesApiRequest request,
+        int startIndex,
+        int maxToolOutputChars = 0)
+    {
+        if (startIndex <= 0)
+        {
+            return Render(request, includeToolNotice: false, maxToolOutputChars);
+        }
+
+        var builder = new StringBuilder();
+        builder.AppendLine("Conversation update:");
+        var appended = false;
+
+        for (var index = startIndex; index < request.Input.Count; index++)
+        {
+            var item = request.Input[index];
+            if (IsAssistantMessage(item) || IsToolItem(item))
+            {
+                continue;
+            }
+
+            AppendInputItem(builder, item, maxToolOutputChars);
+            appended = true;
+        }
+
+        return appended ? builder.ToString().Trim() : string.Empty;
+    }
+
+    public static IReadOnlyList<string> CreateInputFingerprints(ResponsesApiRequest request) =>
+        request.Input
+            .Select(item => item.GetRawText())
+            .ToArray();
+
+    public static int CountCommonInputPrefix(
+        IReadOnlyList<string> previousInputFingerprints,
+        ResponsesApiRequest request)
+    {
+        var count = Math.Min(previousInputFingerprints.Count, request.Input.Count);
+        for (var index = 0; index < count; index++)
+        {
+            if (!string.Equals(previousInputFingerprints[index], request.Input[index].GetRawText(), StringComparison.Ordinal))
+            {
+                return index;
+            }
+        }
+
+        return count;
+    }
+
+    private static void AppendInputItem(StringBuilder builder, JsonElement item, int maxToolOutputChars)
     {
         if (!item.TryGetProperty("type", out var typeElement))
         {
@@ -48,7 +101,7 @@ public static class CodexPromptRenderer
                 break;
             case "function_call_output":
             case "custom_tool_call_output":
-                AppendToolOutput(builder, item, type);
+                AppendToolOutput(builder, item, type, maxToolOutputChars);
                 break;
             case "function_call":
             case "custom_tool_call":
@@ -87,7 +140,7 @@ public static class CodexPromptRenderer
         builder.AppendLine(string.Join(Environment.NewLine, parts.Where(part => !string.IsNullOrWhiteSpace(part))));
     }
 
-    private static void AppendToolOutput(StringBuilder builder, JsonElement item, string type)
+    private static void AppendToolOutput(StringBuilder builder, JsonElement item, string type, int maxToolOutputChars)
     {
         var callId = item.TryGetProperty("call_id", out var callIdElement)
             ? callIdElement.GetString()
@@ -104,7 +157,7 @@ public static class CodexPromptRenderer
 
         if (item.TryGetProperty("output", out var output))
         {
-            builder.AppendLine(OutputToText(output));
+            builder.AppendLine(ToolOutputText.Render(output, maxToolOutputChars));
         }
         else
         {
@@ -129,29 +182,29 @@ public static class CodexPromptRenderer
         builder.AppendLine(JsonSerializer.Serialize(item, ProtocolJson.SerializerOptions));
     }
 
-    private static string OutputToText(JsonElement output) =>
-        output.ValueKind switch
-        {
-            JsonValueKind.String => output.GetString() ?? string.Empty,
-            JsonValueKind.Array => RenderOutputArray(output),
-            _ => JsonSerializer.Serialize(output, ProtocolJson.SerializerOptions)
-        };
-
-    private static string RenderOutputArray(JsonElement output)
+    private static bool IsAssistantMessage(JsonElement item)
     {
-        var parts = new List<string>();
-        foreach (var item in output.EnumerateArray())
+        if (!item.TryGetProperty("type", out var typeElement) ||
+            typeElement.GetString() != "message" ||
+            !item.TryGetProperty("role", out var roleElement))
         {
-            if (item.TryGetProperty("text", out var text))
-            {
-                parts.Add(text.GetString() ?? string.Empty);
-            }
-            else
-            {
-                parts.Add(JsonSerializer.Serialize(item, ProtocolJson.SerializerOptions));
-            }
+            return false;
         }
 
-        return string.Join(Environment.NewLine, parts.Where(part => !string.IsNullOrWhiteSpace(part)));
+        return roleElement.GetString() == "assistant";
+    }
+
+    private static bool IsToolItem(JsonElement item)
+    {
+        if (!item.TryGetProperty("type", out var typeElement))
+        {
+            return false;
+        }
+
+        return typeElement.GetString() is
+            "function_call" or
+            "custom_tool_call" or
+            "function_call_output" or
+            "custom_tool_call_output";
     }
 }

@@ -4,6 +4,7 @@ namespace CodexCopilotBridge.Inference;
 
 internal sealed class PendingToolCallCleanupService(
     PendingToolCallStore pendingToolCalls,
+    ConversationSessionStore conversationSessions,
     IOptions<BridgeOptions> options,
     ILogger<PendingToolCallCleanupService> logger) : BackgroundService
 {
@@ -19,10 +20,19 @@ internal sealed class PendingToolCallCleanupService(
                     DateTimeOffset.UtcNow,
                     Positive(options.Value.PendingToolCallTtl, TimeSpan.FromHours(1)),
                     stoppingToken);
+                var expiredConversations = await conversationSessions.ExpireAsync(
+                    DateTimeOffset.UtcNow,
+                    Positive(options.Value.ConversationSessionTtl, BridgeOptions.DefaultConversationSessionTtl),
+                    stoppingToken);
 
                 if (expired > 0)
                 {
                     logger.LogInformation("Expired {ExpiredCount} pending Copilot tool call(s).", expired);
+                }
+
+                if (expiredConversations > 0)
+                {
+                    logger.LogInformation("Expired {ExpiredCount} reusable Copilot conversation session(s).", expiredConversations);
                 }
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)

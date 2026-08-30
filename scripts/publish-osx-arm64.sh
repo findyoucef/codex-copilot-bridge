@@ -14,9 +14,10 @@ dotnet publish "$ROOT_DIR/CodexCopilotBridge/CodexCopilotBridge.csproj" \
   --configuration Release \
   --runtime osx-arm64 \
   --self-contained true \
-  -p:PublishSingleFile=true \
-  -p:EnableCompressionInSingleFile=true \
   --output "$PUBLISH_DIR"
+
+cp "$ROOT_DIR/scripts/codex-copilot" "$PUBLISH_DIR/codex-copilot"
+chmod +x "$PUBLISH_DIR/codex-copilot"
 
 tar -C "$PUBLISH_ROOT" -czf "$ARCHIVE" "codex-copilot-bridge-osx-arm64"
 

@@ -17,6 +17,7 @@ public static class JsonResponseWriter
         string? finalText = null;
         var output = new List<object>();
         var emittedToolCall = false;
+        UsageOutput? usage = null;
 
         context.Response.ContentType = "application/json";
         context.Response.Headers["openai-model"] = request.Model;
@@ -35,6 +36,9 @@ public static class JsonResponseWriter
                         {
                             finalText = final.Text;
                         }
+                        break;
+                    case UsageOutput currentUsage:
+                        usage = usage is null ? currentUsage : usage.Add(currentUsage);
                         break;
                     case FunctionCallRequestOutput functionCall:
                         emittedToolCall = true;
@@ -55,7 +59,12 @@ public static class JsonResponseWriter
 
             context.Response.StatusCode = StatusCodes.Status200OK;
             await context.Response.WriteAsJsonAsync(
-                CompletedResponse(responseId, request.Model, output, endTurn: !emittedToolCall),
+                CompletedResponse(
+                    responseId,
+                    request.Model,
+                    output,
+                    endTurn: !emittedToolCall,
+                    usage?.ToResponseUsage()),
                 ProtocolJson.SerializerOptions,
                 cancellationToken);
         }
@@ -73,7 +82,12 @@ public static class JsonResponseWriter
         }
     }
 
-    private static object CompletedResponse(string responseId, string model, IReadOnlyList<object> output, bool endTurn) =>
+    private static object CompletedResponse(
+        string responseId,
+        string model,
+        IReadOnlyList<object> output,
+        bool endTurn,
+        object? usage) =>
         new
         {
             Id = responseId,
@@ -82,6 +96,7 @@ public static class JsonResponseWriter
             Model = model,
             Output = output,
             EndTurn = endTurn,
+            Usage = usage,
             Error = (object?)null
         };
 

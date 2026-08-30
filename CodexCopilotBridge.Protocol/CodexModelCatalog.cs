@@ -2,35 +2,64 @@ namespace CodexCopilotBridge.Protocol;
 
 public sealed record ModelsResponse(IReadOnlyList<object> Models);
 
+public sealed record CodexModelDescriptor(
+    string Slug,
+    string DisplayName,
+    int ContextWindow,
+    IReadOnlyList<string> SupportedReasoningEfforts,
+    string? DefaultReasoningEffort);
+
 public static class CodexModelCatalog
 {
-    public static ModelsResponse CreateDefault(string model)
+    public static ModelsResponse CreateDefault(
+        string model,
+        int contextWindow = 272_000,
+        int truncationLimitBytes = 10_000_000) =>
+        Create(
+            [new CodexModelDescriptor(model, model, contextWindow, DefaultReasoningEfforts(model), "medium")],
+            truncationLimitBytes);
+
+    public static ModelsResponse Create(
+        IReadOnlyList<CodexModelDescriptor> models,
+        int truncationLimitBytes = 10_000_000)
     {
-        var supportedReasoningLevels = new List<object>
-        {
-            new { Effort = "low", Description = "Low reasoning effort" },
-            new { Effort = "medium", Description = "Medium reasoning effort" },
-            new { Effort = "high", Description = "High reasoning effort" },
-            new { Effort = "xhigh", Description = "Extra high reasoning effort" }
-        };
+        var modelInfos = models
+            .Select((model, index) => CreateModelInfo(model, index + 1, truncationLimitBytes))
+            .ToArray();
 
-        if (model.StartsWith("gpt-5.6", StringComparison.OrdinalIgnoreCase))
-        {
-            supportedReasoningLevels.Add(new { Effort = "max", Description = "Maximum reasoning effort" });
-            supportedReasoningLevels.Add(new { Effort = "ultra", Description = "Maximum reasoning with automatic task delegation" });
-        }
+        return new ModelsResponse(modelInfos);
+    }
 
-        var modelInfo = new
+    private static object CreateModelInfo(
+        CodexModelDescriptor model,
+        int priority,
+        int truncationLimitBytes)
+    {
+        var reasoningEfforts = model.SupportedReasoningEfforts.Count > 0
+            ? model.SupportedReasoningEfforts
+            : ["medium"];
+        var defaultReasoningEffort = reasoningEfforts.Contains(model.DefaultReasoningEffort, StringComparer.Ordinal)
+            ? model.DefaultReasoningEffort!
+            : reasoningEfforts[0];
+        var supportedReasoningLevels = reasoningEfforts
+            .Select(effort => new
+            {
+                Effort = effort,
+                Description = ReasoningEffortDescription(effort)
+            })
+            .ToArray();
+
+        return new
         {
-            Slug = model,
-            DisplayName = model,
+            model.Slug,
+            model.DisplayName,
             Description = "GitHub Copilot model routed through the local Codex Copilot Bridge.",
-            DefaultReasoningLevel = "medium",
+            DefaultReasoningLevel = defaultReasoningEffort,
             SupportedReasoningLevels = supportedReasoningLevels,
             ShellType = "shell_command",
             Visibility = "list",
             SupportedInApi = true,
-            Priority = 1,
+            Priority = priority,
             Upgrade = (object?)null,
             BaseInstructions = string.Empty,
             SupportsReasoningSummaries = false,
@@ -40,14 +69,29 @@ public static class CodexModelCatalog
             TruncationPolicy = new
             {
                 Mode = "bytes",
-                Limit = 10_000_000
+                Limit = truncationLimitBytes
             },
             SupportsParallelToolCalls = false,
             SupportsImageDetailOriginal = false,
-            ContextWindow = 128_000,
+            model.ContextWindow,
             ExperimentalSupportedTools = Array.Empty<string>()
         };
-
-        return new ModelsResponse([modelInfo]);
     }
+
+    private static IReadOnlyList<string> DefaultReasoningEfforts(string model) =>
+        model.StartsWith("gpt-5.6", StringComparison.OrdinalIgnoreCase)
+            ? ["low", "medium", "high", "xhigh", "max", "ultra"]
+            : ["low", "medium", "high", "xhigh"];
+
+    private static string ReasoningEffortDescription(string effort) =>
+        effort switch
+        {
+            "low" => "Low reasoning effort",
+            "medium" => "Medium reasoning effort",
+            "high" => "High reasoning effort",
+            "xhigh" => "Extra high reasoning effort",
+            "max" => "Maximum reasoning effort",
+            "ultra" => "Maximum reasoning with automatic task delegation",
+            _ => $"{effort} reasoning effort"
+        };
 }
