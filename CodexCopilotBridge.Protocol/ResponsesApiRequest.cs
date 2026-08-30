@@ -31,4 +31,21 @@ public sealed record ResponsesApiRequest
     public JsonElement? Text { get; init; }
 
     public IReadOnlyDictionary<string, string>? ClientMetadata { get; init; }
+
+    public string? GetReasoningEffort()
+    {
+        if (Reasoning is not { ValueKind: JsonValueKind.Object } reasoning ||
+            !reasoning.TryGetProperty("effort", out var effort))
+        {
+            return null;
+        }
+
+        if (effort.ValueKind != JsonValueKind.String)
+        {
+            throw new JsonException("The reasoning effort must be a string.");
+        }
+
+        var value = effort.GetString()?.Trim();
+        return string.IsNullOrEmpty(value) ? null : value;
+    }
 }

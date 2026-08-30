@@ -18,6 +18,7 @@ public sealed class CopilotToolProbeInferenceBridge(
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
     {
         var model = string.IsNullOrWhiteSpace(request.Model) ? options.Value.DefaultModel : request.Model;
+        var reasoningEffort = request.GetReasoningEffort();
 
         await foreach (var output in BridgeResponseRunner.RunAsync(options.Value, async (writer, operationToken) =>
         {
@@ -35,6 +36,7 @@ public sealed class CopilotToolProbeInferenceBridge(
                 new SessionConfig
                 {
                     Model = model,
+                    ReasoningEffort = reasoningEffort,
                     Streaming = true,
                     Tools = [CreateBridgeEchoDeclaration()],
                     AvailableTools = [BridgeEchoToolName],

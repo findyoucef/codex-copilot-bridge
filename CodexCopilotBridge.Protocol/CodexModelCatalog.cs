@@ -16,7 +16,7 @@ public static class CodexModelCatalog
         int contextWindow = 272_000,
         int truncationLimitBytes = 10_000_000) =>
         Create(
-            [new CodexModelDescriptor(model, model, contextWindow, DefaultReasoningEfforts(model), "medium")],
+            [new CodexModelDescriptor(model, model, contextWindow, ["medium"], "medium")],
             truncationLimitBytes);
 
     public static ModelsResponse Create(
@@ -77,11 +77,6 @@ public static class CodexModelCatalog
             ExperimentalSupportedTools = Array.Empty<string>()
         };
     }
-
-    private static IReadOnlyList<string> DefaultReasoningEfforts(string model) =>
-        model.StartsWith("gpt-5.6", StringComparison.OrdinalIgnoreCase)
-            ? ["low", "medium", "high", "xhigh", "max", "ultra"]
-            : ["low", "medium", "high", "xhigh"];
 
     private static string ReasoningEffortDescription(string effort) =>
         effort switch

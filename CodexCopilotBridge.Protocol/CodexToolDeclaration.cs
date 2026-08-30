@@ -107,12 +107,9 @@ public static class CodexToolReader
             return;
         }
 
-        var descriptionParts = new[]
-            {
-                namespaceDescription,
-                TryGetString(tool, "description", out var description) ? description : null
-            }
-            .Where(part => !string.IsNullOrWhiteSpace(part));
+        var toolDescription = TryGetString(tool, "description", out var description)
+            ? description
+            : namespaceDescription ?? string.Empty;
 
         var parameters = tool.TryGetProperty("parameters", out var parameterElement)
             ? ReadParametersSchema(parameterElement, options.CompactSchemas)
@@ -122,7 +119,7 @@ public static class CodexToolReader
             copilotName,
             name,
             codexNamespace,
-            string.Join(Environment.NewLine, descriptionParts),
+            toolDescription,
             parameters));
     }
 

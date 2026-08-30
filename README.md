@@ -173,7 +173,7 @@ stream_idle_timeout_ms = 3600000
 EOF
 ```
 
-Codex loads custom-provider model metadata from `model_catalog_json` only at startup; it does not query the bridge directly. The installed `codex-copilot` launcher queries Copilot for the models available to the authenticated account, refreshes that catalog atomically, and then starts Codex with this profile. The profile's `model` is only the initial selection.
+Codex loads custom-provider model metadata from `model_catalog_json` only at startup; it does not query the bridge directly. The installer refreshes the catalog after starting the bridge, and the installed `codex-copilot` launcher refreshes it atomically before every new Codex process. The profile's `model` is only the initial selection. Restart an already-running Codex process after installing a bridge update that changes model capabilities.
 
 Start Copilot-backed Codex and use `/model` to switch among the discovered models:
 
@@ -317,7 +317,7 @@ Set `Bridge:Mode` to `Echo` to test the Codex provider contract without spending
 
 Set `Bridge:Mode` to `CopilotSdk` for text-only Copilot streaming without tool bridging.
 
-The default profile and bridge fallback use `gpt-5.6-sol`. `/v1/models` queries the Copilot SDK for the authenticated account's current model list, context limits, and reasoning efforts. The `codex-copilot` launcher refreshes `~/.codex/copilot-bridge-models.json` before every new Codex process so `/model` stays current. Context windows are capped by `Bridge:CodexContextWindow` because Copilot's model metadata may also advertise separately priced long-context tiers that the bridge does not request.
+The default profile and bridge fallback use `gpt-5.6-sol`. `/v1/models` queries the bundled Copilot runtime for the authenticated account's current model list, context limits, and reasoning efforts without model-specific overrides. The `codex-copilot` launcher refreshes `~/.codex/copilot-bridge-models.json` before every new Codex process so `/model` stays current. The selected reasoning effort is forwarded to Copilot and changing it replaces the reusable Copilot session. Context windows are capped by `Bridge:CodexContextWindow` because Copilot's model metadata may also advertise separately priced long-context tiers that the bridge does not request.
 
 ```bash
 dotnet test
@@ -381,7 +381,7 @@ The probe verifies Copilot external-tool request/response handling through the s
 
 `RequestTimeout` caps each active `/v1/responses` bridge operation. `PendingToolCallTtl` caps how long a Copilot session can wait for Codex to return tool output, including long-running local shell commands. The cleanup service disposes expired sessions on `PendingToolCallCleanupInterval`. `ToolRequestBatchQuietPeriod` waits briefly for adjacent parallel Copilot tool calls before returning them to Codex. `ResponseOutputChannelCapacity` bounds queued stream events so slow clients apply backpressure instead of allowing unbounded memory growth.
 
-Cost controls: `CodexContextWindow` and `CodexTruncationLimitBytes` are advertised in `/v1/models` so Codex sends less history to each fresh bridge session. Keep `CodexContextWindow` aligned with the Copilot SDK's reported provider token limit; the default is `272000`. `MaxToolOutputChars` limits text returned from local tools to Copilot, while non-text tool payloads are omitted. `CompactToolSchemas` strips verbose schema annotations, and declarations are marked deferable so Copilot tool search loads large tool catalogs on demand instead of placing every schema in each model prompt. `ExcludedToolNames` and `ExcludedToolNamePrefixes` prevent tools from being advertised to Copilot; by default the bridge excludes `view_image` because image payloads are not forwarded as images, and `update_plan` because it adds tool turns without improving model context.
+Cost controls: `CodexContextWindow` and `CodexTruncationLimitBytes` are advertised in `/v1/models` so Codex sends less history to each fresh bridge session. Keep `CodexContextWindow` aligned with the Copilot SDK's reported provider token limit; the default is `272000`. `MaxToolOutputChars` limits text returned from local tools to Copilot, while non-text tool payloads are omitted. `CompactToolSchemas` strips verbose schema annotations. Namespaced tool catalogs are represented by a compact search-and-invoke pair so their full schemas are returned only when needed, and namespace descriptions are used only when an individual tool has no description. `ExcludedToolNames` and `ExcludedToolNamePrefixes` prevent tools from being advertised to Copilot; by default the bridge excludes `view_image` because image payloads are not forwarded as images, and `update_plan` because it adds tool turns without improving model context.
 
 Copilot SDK `assistant.usage` events are returned through the standard Responses `usage` object, including input, cached-input, cache-write, output, and reasoning token counts. Multiple Copilot API calls made during one bridge response are summed for that response; reusable sessions do not carry earlier response totals forward. If Copilot omits required input or output counts, the bridge omits `usage` and logs a warning instead of estimating.
 

@@ -55,9 +55,27 @@ launchctl bootstrap "$GUI_DOMAIN" "$PLIST_PATH"
 launchctl enable "$GUI_DOMAIN/$LABEL"
 launchctl kickstart -k "$GUI_DOMAIN/$LABEL"
 
+CATALOG_REFRESHED=false
+if [[ -x "$BIN_DIR/codex-copilot" ]]; then
+  for _ in {1..50}; do
+    if CODEX_BIN=/usr/bin/true \
+      CODEX_COPILOT_BRIDGE_URL="http://127.0.0.1:$PORT" \
+      "$BIN_DIR/codex-copilot" >/dev/null 2>&1; then
+      CATALOG_REFRESHED=true
+      break
+    fi
+    sleep 0.1
+  done
+fi
+
 echo "Installed $LABEL"
 echo "URL: http://127.0.0.1:$PORT"
 echo "Logs: $LOG_DIR"
 if [[ -x "$BIN_DIR/codex-copilot" ]]; then
   echo "Codex launcher: $BIN_DIR/codex-copilot"
+fi
+if [[ "$CATALOG_REFRESHED" == true ]]; then
+  echo "Codex model catalog refreshed"
+else
+  echo "Warning: model catalog was not refreshed; run codex-copilot after the bridge is ready" >&2
 fi

@@ -5,7 +5,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="GitHub.Copilot.SDK" Version="1.0.4" />
+    <PackageReference Include="GitHub.Copilot.SDK" Version="1.0.11" />
     <PackageReference Include="Microsoft.Agents.AI.GitHub.Copilot" Version="1.11.1-rc1" />
   </ItemGroup>
 
@@ -13,6 +13,7 @@
     <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <CopilotCliVersion>1.0.82</CopilotCliVersion>
   </PropertyGroup>
 
 </Project>

@@ -16,6 +16,9 @@ internal sealed class CopilotToolBridgeInferenceBridge(
     ILogger<CopilotToolBridgeInferenceBridge> logger) : IInferenceBridge, IAsyncDisposable
 {
     private static readonly TimeSpan DefaultToolRequestBatchQuietPeriod = TimeSpan.FromMilliseconds(500);
+    internal const string CodexToolSearchName = "codex_copilot_bridge_search_tools";
+    internal const string CodexToolInvokeName = "codex_copilot_bridge_invoke_tool";
+    private const int MaxToolSearchResults = 10;
     private readonly SemaphoreSlim _clientGate = new(1, 1);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _conversationKeyGates = new(StringComparer.Ordinal);
     private CopilotClient? _client;
@@ -138,6 +141,7 @@ internal sealed class CopilotToolBridgeInferenceBridge(
                 ExcludedToolNamePrefixes = bridgeOptions.ExcludedToolNamePrefixes ?? []
             });
         var model = ResolveModel(request);
+        var reasoningEffort = request.GetReasoningEffort();
         var toolSignature = CreateToolSignature(tools);
         var conversationKey = bridgeOptions.EnableConversationSessionReuse
             ? ResolveConversationKey(request)
@@ -166,6 +170,7 @@ internal sealed class CopilotToolBridgeInferenceBridge(
             var resolvedState = await GetOrCreateCopilotStateAsync(
                 conversationKey,
                 model,
+                reasoningEffort,
                 tools,
                 toolSignature,
                 request.Instructions,
@@ -182,7 +187,7 @@ internal sealed class CopilotToolBridgeInferenceBridge(
                 throw new InvalidOperationException("Reusable Copilot session is waiting for tool output, but this request did not include a matching tool output.");
             }
 
-            if (!state.CanReuse(model, toolSignature, request.Instructions) &&
+            if (!state.CanReuse(model, reasoningEffort, toolSignature, request.Instructions) &&
                 !string.IsNullOrWhiteSpace(conversationKey))
             {
                 logger.LogInformation(
@@ -319,6 +324,7 @@ internal sealed class CopilotToolBridgeInferenceBridge(
 
             state = await CreateCopilotStateAsync(
                 model,
+                reasoningEffort,
                 tools,
                 conversationKey ?? string.Empty,
                 request.Instructions,
@@ -437,6 +443,7 @@ internal sealed class CopilotToolBridgeInferenceBridge(
 
     private async Task<CopilotBridgeState> CreateCopilotStateAsync(
         string model,
+        string? reasoningEffort,
         IReadOnlyList<CodexToolDeclaration> tools,
         string conversationKey,
         string instructionsFingerprint,
@@ -448,16 +455,18 @@ internal sealed class CopilotToolBridgeInferenceBridge(
         var config = new SessionConfig
         {
             Model = model,
+            ReasoningEffort = reasoningEffort,
             Streaming = true,
             SkipCustomInstructions = true,
             EnableSkills = false,
             OnPermissionRequest = PermissionHandler.ApproveAll
         };
 
-        if (tools.Count > 0)
+        var copilotTools = CreateCopilotToolDeclarations(tools);
+        if (copilotTools.Count > 0)
         {
-            config.Tools = tools.Select(CreateCopilotToolDeclaration).ToList();
-            config.AvailableTools = tools.Select(tool => tool.CopilotName).ToList();
+            config.Tools = copilotTools;
+            config.AvailableTools = copilotTools.Select(tool => tool.Name).ToList();
         }
 
         var session = await client.CreateSessionAsync(config, cancellationToken);
@@ -465,21 +474,25 @@ internal sealed class CopilotToolBridgeInferenceBridge(
             session,
             tools,
             model,
+            reasoningEffort,
             conversationKey,
             instructionsFingerprint,
             toolSignature);
         session.On<SessionEvent>(evt => HandleSessionEvent(state, evt));
 
         logger.LogInformation(
-            "Started Copilot bridge session with {ToolCount} Codex tool declaration(s). ConversationKey={ConversationKey}",
+            "Started Copilot bridge session with {CodexToolCount} Codex and {CopilotToolCount} Copilot tool declaration(s). ConversationKey={ConversationKey} ReasoningEffort={ReasoningEffort}",
             tools.Count,
-            string.IsNullOrWhiteSpace(conversationKey) ? null : conversationKey);
+            copilotTools.Count,
+            string.IsNullOrWhiteSpace(conversationKey) ? null : conversationKey,
+            reasoningEffort);
         return state;
     }
 
     private async Task<ResolvedCopilotState> GetOrCreateCopilotStateAsync(
         string? conversationKey,
         string model,
+        string? reasoningEffort,
         IReadOnlyList<CodexToolDeclaration> tools,
         string toolSignature,
         string instructionsFingerprint,
@@ -494,6 +507,7 @@ internal sealed class CopilotToolBridgeInferenceBridge(
 
         var state = await CreateCopilotStateAsync(
             model,
+            reasoningEffort,
             tools,
             conversationKey ?? string.Empty,
             instructionsFingerprint,
@@ -509,24 +523,6 @@ internal sealed class CopilotToolBridgeInferenceBridge(
     }
 
     private sealed record ResolvedCopilotState(CopilotBridgeState State, bool Reserved);
-
-    private sealed class DeferredToolDeclaration(AIFunctionDeclaration innerFunction)
-        : AIFunctionDeclaration
-    {
-        public override string Name => innerFunction.Name;
-
-        public override string Description => innerFunction.Description;
-
-        public override JsonElement JsonSchema => innerFunction.JsonSchema;
-
-        public override JsonElement? ReturnJsonSchema => innerFunction.ReturnJsonSchema;
-
-        public override IReadOnlyDictionary<string, object?> AdditionalProperties { get; } =
-            new Dictionary<string, object?>
-            {
-                ["defer"] = CopilotToolDefer.Auto
-            };
-    }
 
     private string ResolveModel(ResponsesApiRequest request) =>
         string.IsNullOrWhiteSpace(request.Model) ? options.Value.DefaultModel : request.Model;
@@ -715,7 +711,23 @@ internal sealed class CopilotToolBridgeInferenceBridge(
             return;
         }
 
-        if (!state.ToolsByCopilotName.TryGetValue(request.ToolName, out var tool))
+        if (string.Equals(request.ToolName, CodexToolSearchName, StringComparison.Ordinal))
+        {
+            // The SDK executes this registered handler; its request event is also broadcast here.
+            return;
+        }
+
+        CodexToolDeclaration tool;
+        var arguments = RenderArguments(request);
+        if (string.Equals(request.ToolName, CodexToolInvokeName, StringComparison.Ordinal))
+        {
+            if (!TryResolveCodexToolInvocation(state.ToolsByCopilotName, arguments, out tool, out arguments, out var error))
+            {
+                exchange.Done.TrySetException(new InvalidOperationException(error));
+                return;
+            }
+        }
+        else if (!state.ToolsByCopilotName.TryGetValue(request.ToolName, out tool!))
         {
             exchange.Done.TrySetException(new InvalidOperationException($"Copilot requested unknown external tool {request.ToolName}."));
             return;
@@ -739,20 +751,189 @@ internal sealed class CopilotToolBridgeInferenceBridge(
         exchange.Write(new FunctionCallRequestOutput(
             callId,
             tool.CodexName,
-            RenderArguments(request),
+            arguments,
             tool.CodexNamespace));
         exchange.CompleteAfterQuietPeriod(Positive(options.Value.ToolRequestBatchQuietPeriod, DefaultToolRequestBatchQuietPeriod));
     }
 
+    internal static List<AIFunctionDeclaration> CreateCopilotToolDeclarations(
+        IReadOnlyList<CodexToolDeclaration> tools)
+    {
+        var declarations = tools
+            .Where(tool => string.IsNullOrWhiteSpace(tool.CodexNamespace))
+            .Select(CreateCopilotToolDeclaration)
+            .ToList();
+        var namespacedTools = tools
+            .Where(tool => !string.IsNullOrWhiteSpace(tool.CodexNamespace))
+            .ToArray();
+        if (namespacedTools.Length == 0)
+        {
+            return declarations;
+        }
+
+        declarations.Add(AIFunctionFactory.Create(
+            (Func<string, string>)(query => SearchCodexTools(namespacedTools, query)),
+            new AIFunctionFactoryOptions
+            {
+                Name = CodexToolSearchName,
+                Description = "Search namespaced Codex tools by service and operation. Returns exact tool names, descriptions, and parameter schemas. Search before calling the invoke tool."
+            }));
+        declarations.Add(AIFunctionFactory.CreateDeclaration(
+            CodexToolInvokeName,
+            "Invoke a namespaced Codex tool using an exact name and arguments returned by the search tool.",
+            JsonSerializer.Deserialize<JsonElement>(
+                """
+                {
+                  "type": "object",
+                  "properties": {
+                    "name": { "type": "string" },
+                    "arguments": { "type": "object", "additionalProperties": true }
+                  },
+                  "required": ["name", "arguments"],
+                  "additionalProperties": false
+                }
+                """,
+                ProtocolJson.SerializerOptions),
+            returnJsonSchema: null));
+        return declarations;
+    }
+
+    internal static string SearchCodexTools(
+        IReadOnlyList<CodexToolDeclaration> tools,
+        string query)
+    {
+        var normalizedQuery = NormalizeSearchText(query);
+        var terms = normalizedQuery
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        var matches = tools
+            .Select(tool => new { Tool = tool, Score = ScoreToolMatch(tool, normalizedQuery, terms) })
+            .Where(match => match.Score > 0)
+            .OrderByDescending(match => match.Score)
+            .ThenBy(match => match.Tool.CopilotName, StringComparer.Ordinal)
+            .Take(MaxToolSearchResults)
+            .Select(match => new
+            {
+                name = match.Tool.CopilotName,
+                description = match.Tool.Description,
+                parameters = match.Tool.Parameters
+            });
+
+        return JsonSerializer.Serialize(new { tools = matches }, ProtocolJson.SerializerOptions);
+    }
+
+    internal static bool TryResolveCodexToolInvocation(
+        IReadOnlyDictionary<string, CodexToolDeclaration> toolsByCopilotName,
+        string invocationJson,
+        out CodexToolDeclaration tool,
+        out string argumentsJson,
+        out string error)
+    {
+        tool = null!;
+        argumentsJson = "{}";
+        error = string.Empty;
+
+        try
+        {
+            using var document = JsonDocument.Parse(invocationJson);
+            var root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object ||
+                !root.TryGetProperty("name", out var nameElement) ||
+                nameElement.ValueKind != JsonValueKind.String ||
+                string.IsNullOrWhiteSpace(nameElement.GetString()))
+            {
+                error = $"Copilot called {CodexToolInvokeName} without a valid tool name.";
+                return false;
+            }
+
+            var name = nameElement.GetString()!;
+            if (!toolsByCopilotName.TryGetValue(name, out tool!))
+            {
+                error = $"Copilot requested unknown Codex tool {name}.";
+                return false;
+            }
+
+            if (!root.TryGetProperty("arguments", out var argumentsElement) ||
+                argumentsElement.ValueKind != JsonValueKind.Object)
+            {
+                error = $"Copilot called {CodexToolInvokeName} without an arguments object.";
+                return false;
+            }
+
+            argumentsJson = argumentsElement.GetRawText();
+            return true;
+        }
+        catch (JsonException exception)
+        {
+            error = $"Copilot called {CodexToolInvokeName} with invalid JSON: {exception.Message}";
+            return false;
+        }
+    }
+
     private static AIFunctionDeclaration CreateCopilotToolDeclaration(CodexToolDeclaration tool) =>
-        new DeferredToolDeclaration(
-            AIFunctionFactory.CreateDeclaration(
-                tool.CopilotName,
-                string.IsNullOrWhiteSpace(tool.Description)
-                    ? $"Execute the Codex {tool.CodexName} tool."
-                    : tool.Description,
-                tool.Parameters,
-                returnJsonSchema: null));
+        AIFunctionFactory.CreateDeclaration(
+            tool.CopilotName,
+            string.IsNullOrWhiteSpace(tool.Description)
+                ? $"Execute the Codex {tool.CodexName} tool."
+                : tool.Description,
+            tool.Parameters,
+            returnJsonSchema: null);
+
+    private static int ScoreToolMatch(
+        CodexToolDeclaration tool,
+        string normalizedQuery,
+        IReadOnlyList<string> terms)
+    {
+        if (terms.Count == 0)
+        {
+            return 0;
+        }
+
+        var name = NormalizeSearchText(tool.CodexName);
+        var description = NormalizeSearchText(tool.Description);
+        var toolNamespace = NormalizeSearchText(tool.CodexNamespace ?? string.Empty);
+        var score = string.Equals(name, normalizedQuery, StringComparison.Ordinal) ? 1000 : 0;
+        if (name.Contains(normalizedQuery, StringComparison.Ordinal))
+        {
+            score += 120;
+        }
+        if (description.Contains(normalizedQuery, StringComparison.Ordinal))
+        {
+            score += 40;
+        }
+
+        foreach (var term in terms)
+        {
+            if (name.Contains(term, StringComparison.Ordinal))
+            {
+                score += 20;
+            }
+            if (description.Contains(term, StringComparison.Ordinal))
+            {
+                score += 5;
+            }
+            if (toolNamespace.Contains(term, StringComparison.Ordinal))
+            {
+                score += 2;
+            }
+        }
+
+        return score;
+    }
+
+    private static string NormalizeSearchText(string value)
+    {
+        var builder = new StringBuilder(value.Length);
+        foreach (var character in value)
+        {
+            builder.Append(char.IsAsciiLetterOrDigit(character)
+                ? char.ToLowerInvariant(character)
+                : ' ');
+        }
+
+        return builder.ToString();
+    }
 
     private static string RenderArguments(ExternalToolRequestedData request)
     {
@@ -909,6 +1090,7 @@ internal sealed class CopilotToolBridgeInferenceBridge(
         CopilotSession session,
         IReadOnlyList<CodexToolDeclaration> tools,
         string model,
+        string? reasoningEffort,
         string conversationKey,
         string instructionsFingerprint,
         string toolSignature) : IReusableBridgeSession
@@ -924,6 +1106,8 @@ internal sealed class CopilotToolBridgeInferenceBridge(
         public CopilotSession Session { get; } = session;
 
         public string Model { get; } = model;
+
+        public string? ReasoningEffort { get; } = reasoningEffort;
 
         public string ConversationKey { get; } = conversationKey;
 
@@ -998,13 +1182,18 @@ internal sealed class CopilotToolBridgeInferenceBridge(
 
         public void Touch(DateTimeOffset now) => Interlocked.Exchange(ref _lastSeenTicks, now.UtcTicks);
 
-        public bool CanReuse(string model, string toolSignature, string instructionsFingerprint)
+        public bool CanReuse(
+            string model,
+            string? reasoningEffort,
+            string toolSignature,
+            string instructionsFingerprint)
         {
             lock (_sync)
             {
                 return !_disposed &&
                     !_faulted &&
                     string.Equals(Model, model, StringComparison.Ordinal) &&
+                    string.Equals(ReasoningEffort, reasoningEffort, StringComparison.Ordinal) &&
                     string.Equals(ToolSignature, toolSignature, StringComparison.Ordinal) &&
                     string.Equals(InstructionsFingerprint, instructionsFingerprint, StringComparison.Ordinal);
             }

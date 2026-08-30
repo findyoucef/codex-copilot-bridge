@@ -210,6 +210,26 @@ public sealed class ProtocolTests
         Assert.Equal("window-1", request.ClientMetadata["x-codex-window-id"]);
     }
 
+    [Theory]
+    [InlineData("low")]
+    [InlineData("high")]
+    [InlineData("max")]
+    public void ResponsesApiRequest_ReadsDynamicReasoningEffort(string effort)
+    {
+        var request = JsonSerializer.Deserialize<ResponsesApiRequest>(
+            $$"""
+            {
+              "reasoning": {
+                "effort": "{{effort}}"
+              }
+            }
+            """,
+            ProtocolJson.SerializerOptions);
+
+        Assert.NotNull(request);
+        Assert.Equal(effort, request.GetReasoningEffort());
+    }
+
     [Fact]
     public async Task SseResponseWriter_UsesDistinctOutputIndexesForMixedTextAndToolCall()
     {
@@ -280,7 +300,7 @@ public sealed class ProtocolTests
     }
 
     [Fact]
-    public void ModelCatalog_IncludesExtendedGpt56ReasoningLevels()
+    public void ModelCatalog_DefaultDoesNotGuessModelReasoningLevels()
     {
         var json = JsonSerializer.Serialize(
             CodexModelCatalog.CreateDefault("gpt-5.6-sol"),
@@ -294,7 +314,7 @@ public sealed class ProtocolTests
             .Select(level => level.GetProperty("effort").GetString()!)
             .ToArray();
 
-        Assert.Equal(["low", "medium", "high", "xhigh", "max", "ultra"], reasoningLevels);
+        Assert.Equal(["medium"], reasoningLevels);
     }
 
     [Fact]
@@ -746,6 +766,14 @@ public sealed class ProtocolTests
                           "order_id": { "type": "string" }
                         }
                       }
+                    },
+                    {
+                      "type": "function",
+                      "name": "list_orders",
+                      "parameters": {
+                        "type": "object",
+                        "properties": {}
+                      }
                     }
                   ]
                 }
@@ -756,12 +784,20 @@ public sealed class ProtocolTests
 
         var tools = CodexToolReader.ReadToolDeclarations(request!);
 
-        var tool = Assert.Single(tools);
-        Assert.Equal("mcp__demo__lookup_order", tool.CopilotName);
-        Assert.Equal("lookup_order", tool.CodexName);
-        Assert.Equal("mcp__demo__", tool.CodexNamespace);
-        Assert.Contains("Demo tools.", tool.Description);
-        Assert.Contains("Look up an order.", tool.Description);
+        Assert.Collection(
+            tools,
+            tool =>
+            {
+                Assert.Equal("mcp__demo__lookup_order", tool.CopilotName);
+                Assert.Equal("lookup_order", tool.CodexName);
+                Assert.Equal("mcp__demo__", tool.CodexNamespace);
+                Assert.Equal("Look up an order.", tool.Description);
+            },
+            tool =>
+            {
+                Assert.Equal("mcp__demo__list_orders", tool.CopilotName);
+                Assert.Equal("Demo tools.", tool.Description);
+            });
     }
 
     private sealed class FakeBridge(params BridgeOutput[] outputs) : IInferenceBridge

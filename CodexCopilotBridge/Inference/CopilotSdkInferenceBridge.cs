@@ -12,6 +12,7 @@ public sealed class CopilotSdkInferenceBridge(IOptions<BridgeOptions> options, I
     {
         var prompt = CodexPromptRenderer.Render(request);
         var model = string.IsNullOrWhiteSpace(request.Model) ? options.Value.DefaultModel : request.Model;
+        var reasoningEffort = request.GetReasoningEffort();
 
         await foreach (var output in BridgeResponseRunner.RunAsync(options.Value, async (writer, operationToken) =>
         {
@@ -29,6 +30,7 @@ public sealed class CopilotSdkInferenceBridge(IOptions<BridgeOptions> options, I
                 new SessionConfig
                 {
                     Model = model,
+                    ReasoningEffort = reasoningEffort,
                     Streaming = true
                 },
                 operationToken);
