@@ -37,12 +37,13 @@ internal sealed class CopilotToolBridgeInferenceBridge(
             {
                 await ContinuePendingToolCallsAsync(request, pendingToolOutputs, writer, operationToken);
             }
-            else if (outputMatch == PendingToolOutputMatchKind.Retired)
-            {
-                logger.LogInformation("Ignoring stale Codex tool output for a completed or retired Copilot tool call.");
-            }
             else
             {
+                if (outputMatch == PendingToolOutputMatchKind.Retired)
+                {
+                    logger.LogInformation("Ignoring stale Codex tool output for a completed or retired Copilot tool call.");
+                }
+
                 await StartCopilotTurnAsync(request, writer, operationToken);
             }
         }, cancellationToken))
@@ -165,7 +166,6 @@ internal sealed class CopilotToolBridgeInferenceBridge(
         var stateReserved = false;
         var disposeState = false;
         var gateHeld = false;
-        var preserveStateOnError = false;
         var commonPrefix = 0;
         var sendFullPrompt = true;
         var prompt = string.Empty;
@@ -188,18 +188,10 @@ internal sealed class CopilotToolBridgeInferenceBridge(
 
             if (state.WaitingForToolOutput)
             {
-                if (!string.IsNullOrWhiteSpace(conversationKey))
-                {
-                    logger.LogInformation(
-                        "Restarting reusable Copilot session because it was waiting for tool output from a cancelled turn. ConversationKey={ConversationKey}",
-                        conversationKey);
-                    await RestartStateAsync();
-                }
-                else
-                {
-                    preserveStateOnError = true;
-                    throw new InvalidOperationException("Reusable Copilot session is waiting for tool output, but this request did not include a matching tool output.");
-                }
+                logger.LogInformation(
+                    "Restarting Copilot session because it was waiting for tool output from a cancelled or compacted turn. ConversationKey={ConversationKey}",
+                    conversationKey);
+                await RestartStateAsync();
             }
 
             if (!state.CanReuse(model, reasoningEffort, toolSignature, request.Instructions) &&
@@ -282,8 +274,7 @@ internal sealed class CopilotToolBridgeInferenceBridge(
         }
         catch
         {
-            disposeState = !preserveStateOnError &&
-                (gateHeld || string.IsNullOrWhiteSpace(conversationKey));
+            disposeState = gateHeld || string.IsNullOrWhiteSpace(conversationKey);
             throw;
         }
         finally
